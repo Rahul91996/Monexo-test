@@ -2036,13 +2036,16 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
 
   if (!txId && !rptNo) return false;
 
-  // STRICT RULE: Sell counterpart transactions (SELL_...) must NEVER credit buyer balance!
+  // STRICT RULE 1: Sell counterpart transactions (SELL_...) must NEVER credit buyer balance!
   if (tx.type === 'sell' || String(rptNo || '').startsWith('SELL_')) {
     return false;
   }
 
-  const isSuccess = tx.payer_status === 3 || String(tx.orderStateText || '').toLowerCase().includes('success') || String(tx.statusText || '').toLowerCase().includes('success');
-  if (!isSuccess) return false;
+  // STRICT RULE 2: In-memory object MUST have payer_status === 3 (SUCCESSFUL ONLY)!
+  // In-review orders (payer_status === 2 or 1) MUST NOT be credited!
+  if (Number(tx.payer_status) !== 3) {
+    return false;
+  }
 
   const amount = Number(tx.amount || 0);
   if (amount <= 0) return false;
@@ -2050,8 +2053,9 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
   const totalCredit = Math.round((amount + reward4Pct) * 100) / 100;
 
   // ATOMIC LOCK STEP: Mark isBalanceCredited = true FIRST in MongoDB!
-  // This ensures ONLY ONE thread/process across the entire application ever enters the balance credit logic!
+  // MUST strictly match payer_status: 3 in DB so that pending/in-review orders NEVER match!
   const queryFilter: any = {
+    payer_status: 3,
     isBalanceCredited: { $ne: true },
     type: { $ne: 'sell' },
     rptNo: { $not: /^SELL_/i }
@@ -2078,7 +2082,7 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
   ).catch(() => null);
 
   if (!claimedTx) {
-    // Already credited by another process or invalid! Abort immediately!
+    // Already credited by another process, or order is not in status 3 in DB! Abort immediately!
     return false;
   }
 

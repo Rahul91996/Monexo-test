@@ -1693,13 +1693,15 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
   if (tx.type === "sell" || String(rptNo || "").startsWith("SELL_")) {
     return false;
   }
-  const isSuccess = tx.payer_status === 3 || String(tx.orderStateText || "").toLowerCase().includes("success") || String(tx.statusText || "").toLowerCase().includes("success");
-  if (!isSuccess) return false;
+  if (Number(tx.payer_status) !== 3) {
+    return false;
+  }
   const amount = Number(tx.amount || 0);
   if (amount <= 0) return false;
   const reward4Pct = Math.round(amount * 0.04 * 100) / 100;
   const totalCredit = Math.round((amount + reward4Pct) * 100) / 100;
   const queryFilter = {
+    payer_status: 3,
     isBalanceCredited: { $ne: true },
     type: { $ne: "sell" },
     rptNo: { $not: /^SELL_/i }
