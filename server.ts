@@ -1998,6 +1998,89 @@ async function verifyOtpCode(phone: string, smscode: any): Promise<boolean> {
   return checkWorkerOtpResult(verifyRes, cleanCode);
 }
 
+async function ensureBuyerBalanceCredited(tx: any): Promise<boolean> {
+  if (!tx) return false;
+  const isSuccess = tx.payer_status === 3 || String(tx.orderStateText || '').toLowerCase().includes('success') || String(tx.statusText || '').toLowerCase().includes('success');
+  if (!isSuccess) return false;
+  if ((tx as any).isBalanceCredited === true) return false; // Already credited, avoid duplicate crediting
+
+  const buyer = await User.findOne({
+    $or: [
+      { _id: tx.buyerUserId },
+      { _id: tx.userId },
+      { phone: tx.buyerPhone },
+      { phone: tx.phone },
+      { mobileNo: tx.buyerPhone },
+      { mobileNo: tx.phone }
+    ].filter(Boolean)
+  });
+
+  if (buyer) {
+    const reward4Pct = Math.round(((tx.amount || 0) * 0.04) * 100) / 100;
+    tx.reward = reward4Pct;
+    (tx as any).isBalanceCredited = true;
+    if (tx.save) await tx.save().catch(() => {});
+
+    buyer.balance = Math.round(((buyer.balance || 0) + (tx.amount || 0) + reward4Pct) * 100) / 100;
+    buyer.recharge = Math.round(((buyer.recharge || 0) + (tx.amount || 0)) * 100) / 100;
+    await buyer.save();
+
+    await distributeTeamCommission(buyer, tx.amount || 0).catch(() => {});
+    console.log(`[INSTANT WALLET CREDIT +4%] Buyer ${buyer.phone} credited +₹${tx.amount} + ₹${reward4Pct} (4% reward). New Balance: ₹${buyer.balance}`);
+    return true;
+  }
+  return false;
+}
+
+async function getDistinctPayeeUpi(tx: any, buyerSelectedUpi: string, user: any): Promise<string> {
+  const knownBuyerUpis = new Set<string>();
+  if (buyerSelectedUpi) knownBuyerUpis.add(buyerSelectedUpi.toLowerCase().trim());
+  if (user && user.phone) knownBuyerUpis.add(user.phone.toLowerCase().trim());
+  if (user && user.collectionTools) {
+    user.collectionTools.forEach((t: any) => {
+      if (t.upi) knownBuyerUpis.add(t.upi.toLowerCase().trim());
+      if (t.account) knownBuyerUpis.add(t.account.toLowerCase().trim());
+    });
+  }
+
+  const isBuyerUpi = (str: string) => {
+    if (!str) return true;
+    const clean = str.toLowerCase().trim();
+    if (knownBuyerUpis.has(clean)) return true;
+    if (buyerSelectedUpi && buyerSelectedUpi.toLowerCase().trim() === clean) return true;
+    return false;
+  };
+
+  let candidatePayee = tx.payee_bank_account || tx.receiverUpi || tx.payeeAccount || "";
+  if (candidatePayee && !isBuyerUpi(candidatePayee)) {
+    return candidatePayee;
+  }
+
+  if (tx.rptNo && orderSlipMap.has(tx.rptNo)) {
+    const slip = orderSlipMap.get(tx.rptNo);
+    if (slip && slip.upi && !isBuyerUpi(slip.upi)) {
+      return slip.upi;
+    }
+  }
+
+  if (tx.sellerId || tx.sellerPhone) {
+    const seller = await User.findOne({
+      $or: [{ _id: tx.sellerId }, { phone: tx.sellerPhone }].filter(Boolean)
+    });
+    if (seller && seller.collectionTools) {
+      const sTool = seller.collectionTools.find((t: any) => t && t.upi && !isBuyerUpi(t.upi));
+      if (sTool) return sTool.upi;
+    }
+  }
+
+  const activeNode = await PaymentNode.findOne({ status: true });
+  if (activeNode && activeNode.accountNumber && !isBuyerUpi(activeNode.accountNumber)) {
+    return activeNode.accountNumber;
+  }
+
+  return "7870873927@axl"; // Default payee/seller UPI if no other seller tool found
+}
+
 // Serve uploaded support media statically
 app.use('/uploads', express.static(path.join(process.cwd(), 'public', 'uploads')));
 
@@ -4987,7 +5070,15 @@ app.get('/xxapi/buyitoken/paymentslipdetail', async (req, res) => {
   const channelName = mapCtTypeToUpiType(ctTypeVal);
   const ctNameVal = selectedPayerTool || mapCtTypeToName(ctTypeVal);
 
+  const distinctPayeeUpi = await getDistinctPayeeUpi(tx || { payee_bank_account, rptNo: id }, selectedPayerUpi, currentUser);
+  if (distinctPayeeUpi) {
+    payee_bank_account = distinctPayeeUpi;
+  }
+
   const currentPayerStatus = tx ? tx.payer_status : (slipData && slipData.payer_status ? slipData.payer_status : 1);
+  if (currentPayerStatus === 3 && tx && !(tx as any).isBalanceCredited) {
+    ensureBuyerBalanceCredited(tx).catch(() => {});
+  }
   const methodNum = isUpi ? 1 : 2;
 
   return res.json({
@@ -8773,28 +8864,9 @@ async function getRechargeHistory(req: any, res: any) {
     if (buyerSelectedUpi) buyerUpis.push(String(buyerSelectedUpi).toLowerCase().trim());
 
     // 2. Payee / Receiver UPI (jisko payment karna hai -> Seller/Merchant UPI)
-    let payeeUpi = tx.payee_bank_account || tx.receiverUpi || tx.payeeAccount || "";
-    if (!payeeUpi || buyerUpis.some(b => b && payeeUpi.toLowerCase().trim().includes(b))) {
-      payeeUpi = "";
-      if (tx.rptNo && orderSlipMap.has(tx.rptNo)) {
-        const slip = orderSlipMap.get(tx.rptNo);
-        if (slip && slip.upi && !buyerUpis.some(b => b && slip.upi.toLowerCase().trim().includes(b))) {
-          payeeUpi = slip.upi;
-        }
-      }
-    }
-    if ((!payeeUpi || buyerUpis.some(b => b && payeeUpi.toLowerCase().trim().includes(b))) && (tx.sellerId || tx.sellerPhone)) {
-      const seller = await User.findOne({
-        $or: [{ _id: tx.sellerId }, { phone: tx.sellerPhone }].filter(Boolean)
-      });
-      if (seller) {
-        const sTool = (seller.collectionTools || []).find((t: any) => t && t.upi && t.upi.includes('@') && !buyerUpis.some(b => b && t.upi.toLowerCase().trim().includes(b)));
-        if (sTool) payeeUpi = sTool.upi;
-      }
-    }
-    if (!payeeUpi || buyerUpis.some(b => b && payeeUpi.toLowerCase().trim().includes(b))) {
-      const node = await PaymentNode.findOne({ status: true });
-      if (node && node.accountNumber) payeeUpi = node.accountNumber;
+    const payeeUpi = await getDistinctPayeeUpi(tx, buyerSelectedUpi, user);
+    if (tx.payer_status === 3 && !(tx as any).isBalanceCredited) {
+      ensureBuyerBalanceCredited(tx).catch(() => {});
     }
 
     const debitTimeSec = tx.ctime || Math.floor(Date.now() / 1000);
