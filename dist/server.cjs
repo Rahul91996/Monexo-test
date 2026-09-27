@@ -1682,6 +1682,9 @@ async function verifyOtpCode(phone, smscode) {
 }
 async function ensureBuyerBalanceCredited(tx, fallbackUser) {
   if (!tx || !tx._id) return false;
+  if (tx.type === "sell" || String(tx.rptNo || "").startsWith("SELL_")) {
+    return false;
+  }
   const isSuccess = tx.payer_status === 3 || String(tx.orderStateText || "").toLowerCase().includes("success") || String(tx.statusText || "").toLowerCase().includes("success");
   if (!isSuccess) return false;
   const amount = Number(tx.amount || 0);
@@ -1767,7 +1770,7 @@ async function getDistinctPayeeUpi(tx, buyerSelectedUpi, user) {
     }
     return false;
   };
-  let candidatePayee = tx.payee_bank_account || tx.receiverUpi || tx.payeeAccount || "";
+  let candidatePayee = tx.receiverUpi || tx.receiveAccount || tx.payeeAccount || tx.payee_bank_account || tx.upi || "";
   if (candidatePayee && !isBuyerUpi(candidatePayee)) {
     return candidatePayee;
   }

@@ -2024,6 +2024,12 @@ async function verifyOtpCode(phone: string, smscode: any): Promise<boolean> {
 
 async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<boolean> {
   if (!tx || !tx._id) return false;
+
+  // STRICT RULE: Sell counterpart transactions (SELL_...) must NEVER credit buyer balance!
+  if (tx.type === 'sell' || String(tx.rptNo || '').startsWith('SELL_')) {
+    return false;
+  }
+
   const isSuccess = tx.payer_status === 3 || String(tx.orderStateText || '').toLowerCase().includes('success') || String(tx.statusText || '').toLowerCase().includes('success');
   if (!isSuccess) return false;
 
@@ -2124,7 +2130,7 @@ async function getDistinctPayeeUpi(tx: any, buyerSelectedUpi: string, user: any)
     return false;
   };
 
-  let candidatePayee = tx.payee_bank_account || tx.receiverUpi || tx.payeeAccount || "";
+  let candidatePayee = (tx as any).receiverUpi || (tx as any).receiveAccount || (tx as any).payeeAccount || tx.payee_bank_account || tx.upi || "";
   if (candidatePayee && !isBuyerUpi(candidatePayee)) {
     return candidatePayee;
   }
