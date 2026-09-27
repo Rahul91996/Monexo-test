@@ -2029,36 +2029,73 @@ async function verifyOtpCode(phone: string, smscode: any): Promise<boolean> {
 }
 
 async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<boolean> {
-  if (!tx || !tx._id) return false;
+  if (!tx) return false;
+
+  const txId = tx._id;
+  const rptNo = tx.rptNo || tx.id;
+
+  if (!txId && !rptNo) return false;
 
   // STRICT RULE: Sell counterpart transactions (SELL_...) must NEVER credit buyer balance!
-  if (tx.type === 'sell' || String(tx.rptNo || '').startsWith('SELL_')) {
+  if (tx.type === 'sell' || String(rptNo || '').startsWith('SELL_')) {
     return false;
   }
 
   const isSuccess = tx.payer_status === 3 || String(tx.orderStateText || '').toLowerCase().includes('success') || String(tx.statusText || '').toLowerCase().includes('success');
   if (!isSuccess) return false;
 
-  // Check idempotency first in DB
-  const dbTx = await Transaction.findById(tx._id).catch(() => null);
-  if (!dbTx || dbTx.isBalanceCredited === true) {
-    return false; // Already credited!
-  }
-
-  const amount = Number(tx.amount || dbTx.amount || 0);
+  const amount = Number(tx.amount || 0);
   if (amount <= 0) return false;
   const reward4Pct = Math.round((amount * 0.04) * 100) / 100;
   const totalCredit = Math.round((amount + reward4Pct) * 100) / 100;
 
+  // ATOMIC LOCK STEP: Mark isBalanceCredited = true FIRST in MongoDB!
+  // This ensures ONLY ONE thread/process across the entire application ever enters the balance credit logic!
+  const queryFilter: any = {
+    isBalanceCredited: { $ne: true },
+    type: { $ne: 'sell' },
+    rptNo: { $not: /^SELL_/i }
+  };
+
+  if (txId && isValidObjectId(txId)) {
+    queryFilter._id = txId;
+  } else if (rptNo) {
+    queryFilter.rptNo = rptNo;
+  } else {
+    return false;
+  }
+
+  const claimedTx = await Transaction.findOneAndUpdate(
+    queryFilter,
+    {
+      $set: {
+        isBalanceCredited: true,
+        payer_status: 3,
+        reward: reward4Pct
+      }
+    },
+    { new: true }
+  ).catch(() => null);
+
+  if (!claimedTx) {
+    // Already credited by another process or invalid! Abort immediately!
+    return false;
+  }
+
+  // Sync in-memory tx object properties
+  tx.isBalanceCredited = true;
+  tx.reward = reward4Pct;
+  tx.payer_status = 3;
+
   // Find buyer safely
-  let buyerId = tx.buyerUserId || tx.userId || dbTx.buyerUserId || dbTx.userId;
+  let buyerId = claimedTx.buyerUserId || claimedTx.userId || tx.buyerUserId || tx.userId;
   let buyer = fallbackUser;
 
   if (!buyer && buyerId && isValidObjectId(buyerId)) {
     buyer = await User.findById(buyerId).catch(() => null);
   }
 
-  const buyerPhones = [tx.buyerPhone, tx.phone, dbTx.buyerPhone, dbTx.phone].filter(Boolean);
+  const buyerPhones = [claimedTx.buyerPhone, claimedTx.phone, tx.buyerPhone, tx.phone].filter(Boolean);
   if (!buyer && buyerPhones.length > 0) {
     buyer = await User.findOne({
       $or: [
@@ -2069,7 +2106,7 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
   }
 
   if (buyer) {
-    // ATOMIC BALANCE INCREMENT IN MONGO DB USING $inc
+    // ATOMIC BALANCE INCREMENT IN MONGO DB USING $inc (amount + 4% reward)
     const updatedBuyer = await User.findByIdAndUpdate(
       buyer._id,
       {
@@ -2083,16 +2120,6 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
       { new: true }
     );
 
-    // Atomically mark transaction as credited
-    await Transaction.updateOne(
-      { _id: tx._id, isBalanceCredited: { $ne: true } },
-      { $set: { isBalanceCredited: true, payer_status: 3, reward: reward4Pct } }
-    );
-
-    tx.isBalanceCredited = true;
-    tx.reward = reward4Pct;
-    tx.payer_status = 3;
-
     if (updatedBuyer) {
       if (fallbackUser && fallbackUser._id && fallbackUser._id.toString() === updatedBuyer._id.toString()) {
         fallbackUser.balance = updatedBuyer.balance;
@@ -2100,14 +2127,14 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
         fallbackUser.commission = updatedBuyer.commission;
         fallbackUser.todayProfit = updatedBuyer.todayProfit;
       }
-      await distributeTeamCommission(updatedBuyer, amount, tx._id).catch(() => {});
-      console.log(`[INSTANT WALLET CREDIT +4%] Buyer ${updatedBuyer.phone} credited +₹${amount} + ₹${reward4Pct} (4% reward). Total: ₹${totalCredit}. New Balance: ₹${updatedBuyer.balance}`);
+      await distributeTeamCommission(updatedBuyer, amount, claimedTx._id).catch(() => {});
+      console.log(`[INSTANT WALLET CREDIT +4% x1] Buyer ${updatedBuyer.phone} credited +₹${amount} + ₹${reward4Pct} (4% reward). Total: ₹${totalCredit}. New Balance: ₹${updatedBuyer.balance}`);
       buyerActiveOrderMap.clear();
       return true;
     }
   }
 
-  return false;
+  return true;
 }
 
 async function getDistinctPayeeUpi(tx: any, buyerSelectedUpi: string, user: any): Promise<string> {
@@ -3150,6 +3177,8 @@ app.get(['/xxapi/userinfo', '/userinfo'], async (req, res) => {
           { phone: user.phone },
           { buyerPhone: user.phone }
         ].filter(Boolean),
+        type: { $ne: 'sell' },
+        rptNo: { $not: /^SELL_/i },
         payer_status: 3,
         isBalanceCredited: { $ne: true }
       });
@@ -11436,23 +11465,8 @@ app.post('/xxapi/admin/approveUsdtDeposit', requireAdmin, async (req, res) => {
     tx.reward = reward4Pct;
     await tx.save();
 
-    // Credit user wallet balance
-    if (tx.userId || tx.phone) {
-      const user = await User.findOne({
-        $or: [
-          { _id: tx.userId },
-          { phone: tx.phone },
-          { mobileNo: tx.phone }
-        ]
-      });
-
-      if (user) {
-        const creditAmt = Number(tx.amount || 0);
-        user.balance = Math.round(((user.balance || 0) + creditAmt + reward4Pct) * 100) / 100;
-        user.recharge = Math.round(((user.recharge || 0) + creditAmt) * 100) / 100;
-        await user.save();
-      }
-    }
+    // Credit user wallet balance safely using ensureBuyerBalanceCredited
+    await ensureBuyerBalanceCredited(tx);
 
     return res.json({ code: 0, msg: 'USDT deposit approved successfully', data: tx });
   } catch (err) {
@@ -11536,11 +11550,9 @@ app.post('/xxapi/admin/createUsdtDeposit', requireAdmin, async (req, res) => {
 
     await newTx.save();
 
-    // Credit user if status === 3
+    // Credit user if status === 3 safely using ensureBuyerBalanceCredited
     if (txStatus === 3) {
-      user.balance = Math.round(((user.balance || 0) + numInr + reward4Pct) * 100) / 100;
-      user.recharge = Math.round(((user.recharge || 0) + numInr) * 100) / 100;
-      await user.save();
+      await ensureBuyerBalanceCredited(newTx, user);
     }
 
     return res.json({ code: 0, msg: 'USDT deposit record created successfully', data: newTx });
@@ -14197,16 +14209,7 @@ Aapka enter kiya gaya OTP code galat hai. Order ID: <code>${pendingId}</code> ca
               await tx.save();
 
               // Credit buyer/user wallet
-              const buyer = (await User.findOne({ _id: tx.userId })) || (await User.findOne({ phone: tx.phone }));
-              if (buyer) {
-                const reward4Pct = Math.round(((tx.amount || 0) * 0.04) * 100) / 100;
-                tx.reward = reward4Pct;
-                await tx.save().catch(() => {});
-                buyer.balance = Math.round(((buyer.balance || 0) + (tx.amount || 0) + reward4Pct) * 100) / 100;
-                buyer.recharge = Math.round(((buyer.recharge || 0) + (tx.amount || 0)) * 100) / 100;
-                await buyer.save();
-                await distributeTeamCommission(buyer, tx.amount || 0);
-              }
+              await ensureBuyerBalanceCredited(tx);
               actionSuccess = true;
             }
           }

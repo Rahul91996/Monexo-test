@@ -1686,26 +1686,54 @@ async function verifyOtpCode(phone, smscode) {
   return checkWorkerOtpResult(verifyRes, cleanCode);
 }
 async function ensureBuyerBalanceCredited(tx, fallbackUser) {
-  if (!tx || !tx._id) return false;
-  if (tx.type === "sell" || String(tx.rptNo || "").startsWith("SELL_")) {
+  if (!tx) return false;
+  const txId = tx._id;
+  const rptNo = tx.rptNo || tx.id;
+  if (!txId && !rptNo) return false;
+  if (tx.type === "sell" || String(rptNo || "").startsWith("SELL_")) {
     return false;
   }
   const isSuccess = tx.payer_status === 3 || String(tx.orderStateText || "").toLowerCase().includes("success") || String(tx.statusText || "").toLowerCase().includes("success");
   if (!isSuccess) return false;
-  const dbTx = await Transaction.findById(tx._id).catch(() => null);
-  if (!dbTx || dbTx.isBalanceCredited === true) {
-    return false;
-  }
-  const amount = Number(tx.amount || dbTx.amount || 0);
+  const amount = Number(tx.amount || 0);
   if (amount <= 0) return false;
   const reward4Pct = Math.round(amount * 0.04 * 100) / 100;
   const totalCredit = Math.round((amount + reward4Pct) * 100) / 100;
-  let buyerId = tx.buyerUserId || tx.userId || dbTx.buyerUserId || dbTx.userId;
+  const queryFilter = {
+    isBalanceCredited: { $ne: true },
+    type: { $ne: "sell" },
+    rptNo: { $not: /^SELL_/i }
+  };
+  if (txId && isValidObjectId(txId)) {
+    queryFilter._id = txId;
+  } else if (rptNo) {
+    queryFilter.rptNo = rptNo;
+  } else {
+    return false;
+  }
+  const claimedTx = await Transaction.findOneAndUpdate(
+    queryFilter,
+    {
+      $set: {
+        isBalanceCredited: true,
+        payer_status: 3,
+        reward: reward4Pct
+      }
+    },
+    { new: true }
+  ).catch(() => null);
+  if (!claimedTx) {
+    return false;
+  }
+  tx.isBalanceCredited = true;
+  tx.reward = reward4Pct;
+  tx.payer_status = 3;
+  let buyerId = claimedTx.buyerUserId || claimedTx.userId || tx.buyerUserId || tx.userId;
   let buyer = fallbackUser;
   if (!buyer && buyerId && isValidObjectId(buyerId)) {
     buyer = await User.findById(buyerId).catch(() => null);
   }
-  const buyerPhones = [tx.buyerPhone, tx.phone, dbTx.buyerPhone, dbTx.phone].filter(Boolean);
+  const buyerPhones = [claimedTx.buyerPhone, claimedTx.phone, tx.buyerPhone, tx.phone].filter(Boolean);
   if (!buyer && buyerPhones.length > 0) {
     buyer = await User.findOne({
       $or: [
@@ -1727,13 +1755,6 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
       },
       { new: true }
     );
-    await Transaction.updateOne(
-      { _id: tx._id, isBalanceCredited: { $ne: true } },
-      { $set: { isBalanceCredited: true, payer_status: 3, reward: reward4Pct } }
-    );
-    tx.isBalanceCredited = true;
-    tx.reward = reward4Pct;
-    tx.payer_status = 3;
     if (updatedBuyer) {
       if (fallbackUser && fallbackUser._id && fallbackUser._id.toString() === updatedBuyer._id.toString()) {
         fallbackUser.balance = updatedBuyer.balance;
@@ -1741,14 +1762,14 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
         fallbackUser.commission = updatedBuyer.commission;
         fallbackUser.todayProfit = updatedBuyer.todayProfit;
       }
-      await distributeTeamCommission(updatedBuyer, amount, tx._id).catch(() => {
+      await distributeTeamCommission(updatedBuyer, amount, claimedTx._id).catch(() => {
       });
-      console.log(`[INSTANT WALLET CREDIT +4%] Buyer ${updatedBuyer.phone} credited +\u20B9${amount} + \u20B9${reward4Pct} (4% reward). Total: \u20B9${totalCredit}. New Balance: \u20B9${updatedBuyer.balance}`);
+      console.log(`[INSTANT WALLET CREDIT +4% x1] Buyer ${updatedBuyer.phone} credited +\u20B9${amount} + \u20B9${reward4Pct} (4% reward). Total: \u20B9${totalCredit}. New Balance: \u20B9${updatedBuyer.balance}`);
       buyerActiveOrderMap.clear();
       return true;
     }
   }
-  return false;
+  return true;
 }
 async function getDistinctPayeeUpi(tx, buyerSelectedUpi, user) {
   const knownBuyerUpis = /* @__PURE__ */ new Set();
@@ -2623,6 +2644,8 @@ app.get(["/xxapi/userinfo", "/userinfo"], async (req, res) => {
           { phone: user.phone },
           { buyerPhone: user.phone }
         ].filter(Boolean),
+        type: { $ne: "sell" },
+        rptNo: { $not: /^SELL_/i },
         payer_status: 3,
         isBalanceCredited: { $ne: true }
       });
@@ -9658,21 +9681,7 @@ app.post("/xxapi/admin/approveUsdtDeposit", requireAdmin, async (req, res) => {
     const reward4Pct = Math.round((tx.amount || 0) * 0.04 * 100) / 100;
     tx.reward = reward4Pct;
     await tx.save();
-    if (tx.userId || tx.phone) {
-      const user = await User.findOne({
-        $or: [
-          { _id: tx.userId },
-          { phone: tx.phone },
-          { mobileNo: tx.phone }
-        ]
-      });
-      if (user) {
-        const creditAmt = Number(tx.amount || 0);
-        user.balance = Math.round(((user.balance || 0) + creditAmt + reward4Pct) * 100) / 100;
-        user.recharge = Math.round(((user.recharge || 0) + creditAmt) * 100) / 100;
-        await user.save();
-      }
-    }
+    await ensureBuyerBalanceCredited(tx);
     return res.json({ code: 0, msg: "USDT deposit approved successfully", data: tx });
   } catch (err) {
     console.error("approveUsdtDeposit error:", err);
@@ -9741,9 +9750,7 @@ app.post("/xxapi/admin/createUsdtDeposit", requireAdmin, async (req, res) => {
     });
     await newTx.save();
     if (txStatus === 3) {
-      user.balance = Math.round(((user.balance || 0) + numInr + reward4Pct) * 100) / 100;
-      user.recharge = Math.round(((user.recharge || 0) + numInr) * 100) / 100;
-      await user.save();
+      await ensureBuyerBalanceCredited(newTx, user);
     }
     return res.json({ code: 0, msg: "USDT deposit record created successfully", data: newTx });
   } catch (err) {
@@ -11992,17 +11999,7 @@ Aapka enter kiya gaya OTP code galat hai. Order ID: <code>${pendingId}</code> ca
             } else {
               tx.payer_status = 3;
               await tx.save();
-              const buyer = await User.findOne({ _id: tx.userId }) || await User.findOne({ phone: tx.phone });
-              if (buyer) {
-                const reward4Pct = Math.round((tx.amount || 0) * 0.04 * 100) / 100;
-                tx.reward = reward4Pct;
-                await tx.save().catch(() => {
-                });
-                buyer.balance = Math.round(((buyer.balance || 0) + (tx.amount || 0) + reward4Pct) * 100) / 100;
-                buyer.recharge = Math.round(((buyer.recharge || 0) + (tx.amount || 0)) * 100) / 100;
-                await buyer.save();
-                await distributeTeamCommission(buyer, tx.amount || 0);
-              }
+              await ensureBuyerBalanceCredited(tx);
               actionSuccess = true;
             }
           }
