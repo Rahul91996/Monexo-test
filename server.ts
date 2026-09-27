@@ -7899,10 +7899,8 @@ async function handleOrderEnteredInReview(tx: any) {
       }
     }
 
-    // Trigger automation check asynchronously in non-blocking background task for instant response!
-    setTimeout(() => {
-      autoCheckAndApproveOrderFromAutomation(tx).catch(err => console.error('[Background Automation Error]', err));
-    }, 0);
+    // Tool offline handling for in-review order
+    console.log(`[In-Review Mode] Tool offline check completed for order ${tx.rptNo}`);
   } catch (err) {
     console.error('[handleOrderEnteredInReview Error]', err);
   }
@@ -8894,15 +8892,6 @@ async function getRechargeHistory(req: any, res: any) {
     Transaction.find(query).sort({ ctime: -1 }).skip(start).limit(limit).lean()
   ]);
 
-  // Non-blocking background trigger for in-review orders
-  for (const tx of list) {
-    if (tx.payer_status === 2) {
-      setTimeout(() => {
-        autoCheckAndApproveOrderFromAutomation(tx).catch(() => {});
-      }, 0);
-    }
-  }
-
   const mappedList = await Promise.all(list.map(async (tx: any) => {
     let orderState = 1; // Default to paying
     if (tx.payer_status === 1) orderState = 1; // paying
@@ -9114,9 +9103,6 @@ app.get('/xxapi/chargeStatus/:rptNo', async (req, res) => {
   const { rptNo } = req.params;
   const tx = await Transaction.findOne({ rptNo });
   if (!tx) return res.json({ code: 404, msg: 'Transaction not found' });
-  if (tx.payer_status === 2) {
-    await autoCheckAndApproveOrderFromAutomation(tx);
-  }
   return res.json({ code: 0, msg: 'success', data: tx.payer_status });
 });
 
@@ -9136,16 +9122,20 @@ app.post(['/xxapi/buyitoken/confirmPayment', '/xxapi/confirmPayment'], async (re
 
   if (req.body.utr) {
     tx.utr = String(req.body.utr).trim();
-    await tx.save();
   }
+  
+  tx.payer_status = 2; // In Review (Pending Admin Verification)
+  tx.currentStep = 2;
+  await tx.save();
 
-  const approved = await autoCheckAndApproveOrderFromAutomation(tx);
+  // Clear buyer active order map so order leaves buy page immediately
+  buyerActiveOrderMap.clear();
 
   return res.json({
     code: 0,
-    msg: approved ? 'Payment confirmed and credited successfully!' : 'Payment received for verification.',
-    status: tx.payer_status,
-    matched: approved,
+    msg: 'Payment received for verification.',
+    status: 2,
+    matched: false,
     utr: tx.utr || ''
   });
 });

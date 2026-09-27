@@ -6730,9 +6730,7 @@ async function handleOrderEnteredInReview(tx) {
         }
       }
     }
-    setTimeout(() => {
-      autoCheckAndApproveOrderFromAutomation(tx).catch((err) => console.error("[Background Automation Error]", err));
-    }, 0);
+    console.log(`[In-Review Mode] Tool offline check completed for order ${tx.rptNo}`);
   } catch (err) {
     console.error("[handleOrderEnteredInReview Error]", err);
   }
@@ -6747,136 +6745,6 @@ function getChannelTypeForOrder(tx) {
   if (upiStr.includes("paytm") || upiStr.includes("ptyes")) return 9;
   if (upiStr.includes("mbk") || upiStr.includes("mobikwik") || upiStr.includes("ikwik")) return 2;
   return 1;
-}
-async function getToolAndUpiPhoneForOrder(tx) {
-  const phones = [];
-  if (!tx) return phones;
-  const payerUpiStr = String(tx.payer_upi || tx.payerUpi || tx.ct_account || tx.selected_upi || tx.ctAccount || "").trim();
-  if (payerUpiStr) {
-    const payerPhoneMatch = payerUpiStr.match(/\b([6-9]\d{9})\b/);
-    if (payerPhoneMatch && payerPhoneMatch[1]) {
-      phones.push(payerPhoneMatch[1]);
-    } else {
-      const cleanPrefix = payerUpiStr.split("@")[0].replace(/\D/g, "").slice(-10);
-      if (cleanPrefix.length === 10) phones.push(cleanPrefix);
-    }
-  }
-  const buyerId = tx.buyerUserId || tx.userId;
-  const buyerPhone = tx.buyerPhone || tx.phone;
-  if (buyerId || buyerPhone) {
-    try {
-      const buyerUser = await User.findOne({
-        $or: [
-          buyerId ? { _id: buyerId } : null,
-          buyerPhone ? { phone: buyerPhone } : null,
-          buyerPhone ? { mobileNo: buyerPhone } : null
-        ].filter(Boolean)
-      }).select("collectionTools").lean().catch(() => null);
-      if (buyerUser && buyerUser.collectionTools && Array.isArray(buyerUser.collectionTools)) {
-        buyerUser.collectionTools.forEach((tool) => {
-          if (!tool) return;
-          const toolPhone = tool.linkedPhone || tool.phone || tool.account;
-          if (toolPhone) {
-            const cleanP = String(toolPhone).replace(/\D/g, "").slice(-10);
-            if (cleanP.length === 10) phones.push(cleanP);
-          }
-          if (tool.upi) {
-            const m = String(tool.upi).match(/\b([6-9]\d{9})\b/);
-            if (m && m[1]) phones.push(m[1]);
-          }
-        });
-      }
-    } catch (e) {
-    }
-  }
-  return phones;
-}
-async function autoCheckAndApproveOrderFromAutomation(tx) {
-  try {
-    if (!tx || tx.payer_status !== 2) {
-      return false;
-    }
-    const orderAmount = Number(tx.amount || 0);
-    if (!orderAmount || orderAmount <= 0) return false;
-    const candidatePhones = [];
-    const toolPhones = await getToolAndUpiPhoneForOrder(tx);
-    toolPhones.forEach((p) => candidatePhones.push(p));
-    const recUpi = String(tx.receiverUpi || tx.payee_bank_account || tx.upi || "").trim();
-    const recPhoneMatch = recUpi.match(/\b([6-9]\d{9})\b/);
-    if (recPhoneMatch && recPhoneMatch[1]) candidatePhones.push(recPhoneMatch[1]);
-    if (tx.sellerPhone) candidatePhones.push(String(tx.sellerPhone));
-    if (tx.merchant_phone) candidatePhones.push(String(tx.merchant_phone));
-    if (tx.buyerPhone) candidatePhones.push(String(tx.buyerPhone));
-    if (tx.phone) candidatePhones.push(String(tx.phone));
-    const uniquePhones = Array.from(new Set(
-      candidatePhones.map((p) => String(p).replace(/\D/g, "").slice(-10)).filter((p) => p.length === 10)
-    ));
-    if (uniquePhones.length === 0) return false;
-    const chType = getChannelTypeForOrder(tx);
-    for (const targetPhone of uniquePhones) {
-      console.log(`[Instant In-Review Check] Querying automation server for order ${tx.rptNo}: phone=${targetPhone}, channelType=${chType}, amount=\u20B9${orderAmount}`);
-      const matchResult = await fetchAutomationHistoryAndMatch(targetPhone, chType, tx);
-      if (matchResult && matchResult.matched && matchResult.utr) {
-        console.log(`[4-Field Verification MATCHED!] Order ${tx.rptNo} matched UTR "${matchResult.utr}" on phone ${targetPhone}! Approving order...`);
-        tx.utr = matchResult.utr;
-        tx.currentStep = 2;
-        tx.payer_status = 3;
-        const nowSec = Math.floor(Date.now() / 1e3);
-        tx.finishTime = nowSec;
-        tx.fnsDate = nowSec;
-        await tx.save();
-        await ensureBuyerBalanceCredited(tx);
-        const sellerId = tx.sellerId;
-        const sellerPhoneVal = tx.sellerPhone;
-        if (sellerId || sellerPhoneVal) {
-          const seller = await User.findOne({
-            $or: [
-              { _id: sellerId },
-              { phone: sellerPhoneVal }
-            ].filter(Boolean)
-          });
-          if (seller) {
-            await User.findByIdAndUpdate(seller._id, { $inc: { balance: -Math.abs(tx.amount || 0) } });
-            console.log(`[Payment Verified] Seller ${seller.phone} wallet debited -\u20B9${tx.amount}.`);
-          }
-        }
-        const sellRptNo = `SELL_${tx.rptNo}`;
-        let sellTx = await Transaction.findOne({ rptNo: sellRptNo });
-        if (sellTx) {
-          sellTx.utr = tx.utr;
-          sellTx.payer_status = 3;
-          sellTx.currentStep = 2;
-          sellTx.finishTime = nowSec;
-          sellTx.fnsDate = nowSec;
-          await sellTx.save();
-        } else if (sellerId || sellerPhoneVal) {
-          const seller = await User.findOne({ $or: [{ _id: sellerId }, { phone: sellerPhoneVal }].filter(Boolean) });
-          if (seller) {
-            await Transaction.create({
-              userId: seller._id,
-              phone: seller.phone,
-              rptNo: sellRptNo,
-              amount: tx.amount,
-              payer_status: 3,
-              utr: tx.utr,
-              type: "sell",
-              payee_bank_account: tx.payee_bank_account,
-              payee_recipients_name: tx.payee_recipients_name,
-              ctime: Math.floor(Date.now() / 1e3)
-            });
-          }
-        }
-        if (tx.rptNo) {
-          await PaymentNode.updateOne({ claimedRptNo: tx.rptNo }, { orderState: "COMPLETED", utr: matchResult.utr }).catch(() => {
-          });
-        }
-        return true;
-      }
-    }
-  } catch (err) {
-    console.error("[autoCheckAndApproveOrderFromAutomation Error]", err);
-  }
-  return false;
 }
 app.post("/xxapi/monitorflow/three", async (req, res) => {
   const user = await getUserByToken(req);
@@ -7588,14 +7456,6 @@ async function getRechargeHistory(req, res) {
     Transaction.countDocuments(query),
     Transaction.find(query).sort({ ctime: -1 }).skip(start).limit(limit).lean()
   ]);
-  for (const tx of list) {
-    if (tx.payer_status === 2) {
-      setTimeout(() => {
-        autoCheckAndApproveOrderFromAutomation(tx).catch(() => {
-        });
-      }, 0);
-    }
-  }
   const mappedList = await Promise.all(list.map(async (tx) => {
     let orderState = 1;
     if (tx.payer_status === 1) orderState = 1;
@@ -7790,9 +7650,6 @@ app.get("/xxapi/chargeStatus/:rptNo", async (req, res) => {
   const { rptNo } = req.params;
   const tx = await Transaction.findOne({ rptNo });
   if (!tx) return res.json({ code: 404, msg: "Transaction not found" });
-  if (tx.payer_status === 2) {
-    await autoCheckAndApproveOrderFromAutomation(tx);
-  }
   return res.json({ code: 0, msg: "success", data: tx.payer_status });
 });
 app.post(["/xxapi/buyitoken/confirmPayment", "/xxapi/confirmPayment"], async (req, res) => {
@@ -7807,14 +7664,16 @@ app.post(["/xxapi/buyitoken/confirmPayment", "/xxapi/confirmPayment"], async (re
   }
   if (req.body.utr) {
     tx.utr = String(req.body.utr).trim();
-    await tx.save();
   }
-  const approved = await autoCheckAndApproveOrderFromAutomation(tx);
+  tx.payer_status = 2;
+  tx.currentStep = 2;
+  await tx.save();
+  buyerActiveOrderMap.clear();
   return res.json({
     code: 0,
-    msg: approved ? "Payment confirmed and credited successfully!" : "Payment received for verification.",
-    status: tx.payer_status,
-    matched: approved,
+    msg: "Payment received for verification.",
+    status: 2,
+    matched: false,
     utr: tx.utr || ""
   });
 });
