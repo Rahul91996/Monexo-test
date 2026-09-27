@@ -9049,6 +9049,10 @@ app.post(['/xxapi/buyitoken/confirmPayment', '/xxapi/confirmPayment'], async (re
   const tx = await Transaction.findOne({ rptNo });
   if (!tx) return res.json({ code: 404, msg: 'Transaction not found' });
 
+  if (tx.buyerUserId && user && tx.buyerUserId.toString() !== user._id.toString()) {
+    return res.json({ code: 400, msg: "This order is already selected by another user" });
+  }
+
   if (req.body.utr) {
     tx.utr = String(req.body.utr).trim();
     await tx.save();
