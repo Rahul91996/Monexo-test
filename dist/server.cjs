@@ -309,9 +309,12 @@ var logSchema = new import_mongoose.default.Schema({
 });
 var transactionSchema = new import_mongoose.default.Schema({
   userId: { type: import_mongoose.default.Schema.Types.Mixed },
+  buyerUserId: { type: import_mongoose.default.Schema.Types.Mixed },
   sellerId: { type: import_mongoose.default.Schema.Types.Mixed },
   sellerPhone: String,
   phone: String,
+  buyerPhone: String,
+  isBalanceCredited: { type: Boolean, default: false },
   rptNo: { type: String, unique: true },
   amount: Number,
   usdtAmount: { type: Number, default: 0 },
@@ -1657,33 +1660,40 @@ async function verifyOtpCode(phone, smscode) {
   console.log(`[verifyOtpCode] Verification result for phone ${phone}:`, JSON.stringify(verifyRes));
   return checkWorkerOtpResult(verifyRes, cleanCode);
 }
-async function ensureBuyerBalanceCredited(tx) {
+async function ensureBuyerBalanceCredited(tx, fallbackUser) {
   if (!tx) return false;
   const isSuccess = tx.payer_status === 3 || String(tx.orderStateText || "").toLowerCase().includes("success") || String(tx.statusText || "").toLowerCase().includes("success");
   if (!isSuccess) return false;
   if (tx.isBalanceCredited === true) return false;
-  const buyer = await User.findOne({
-    $or: [
-      { _id: tx.buyerUserId },
-      { _id: tx.userId },
-      { phone: tx.buyerPhone },
-      { phone: tx.phone },
-      { mobileNo: tx.buyerPhone },
-      { mobileNo: tx.phone }
-    ].filter(Boolean)
-  });
+  let buyer = fallbackUser;
+  if (!buyer) {
+    buyer = await User.findOne({
+      $or: [
+        { _id: tx.buyerUserId },
+        { _id: tx.userId },
+        { phone: tx.buyerPhone },
+        { phone: tx.phone },
+        { mobileNo: tx.buyerPhone },
+        { mobileNo: tx.phone }
+      ].filter(Boolean)
+    });
+  }
   if (buyer) {
-    const reward4Pct = Math.round((tx.amount || 0) * 0.04 * 100) / 100;
+    const amount = Number(tx.amount || 0);
+    if (amount <= 0) return false;
+    const reward4Pct = Math.round(amount * 0.04 * 100) / 100;
     tx.reward = reward4Pct;
     tx.isBalanceCredited = true;
     if (tx.save) await tx.save().catch(() => {
     });
-    buyer.balance = Math.round(((buyer.balance || 0) + (tx.amount || 0) + reward4Pct) * 100) / 100;
-    buyer.recharge = Math.round(((buyer.recharge || 0) + (tx.amount || 0)) * 100) / 100;
-    await buyer.save();
-    await distributeTeamCommission(buyer, tx.amount || 0).catch(() => {
+    await Transaction.updateOne({ _id: tx._id }, { $set: { isBalanceCredited: true, reward: reward4Pct } }).catch(() => {
     });
-    console.log(`[INSTANT WALLET CREDIT +4%] Buyer ${buyer.phone} credited +\u20B9${tx.amount} + \u20B9${reward4Pct} (4% reward). New Balance: \u20B9${buyer.balance}`);
+    buyer.balance = Math.round(((buyer.balance || 0) + amount + reward4Pct) * 100) / 100;
+    buyer.recharge = Math.round(((buyer.recharge || 0) + amount) * 100) / 100;
+    await buyer.save();
+    await distributeTeamCommission(buyer, amount).catch(() => {
+    });
+    console.log(`[INSTANT WALLET CREDIT +4%] Buyer ${buyer.phone} credited +\u20B9${amount} + \u20B9${reward4Pct} (4% reward). New Balance: \u20B9${buyer.balance}`);
     return true;
   }
   return false;
@@ -2476,7 +2486,7 @@ async function getUserSellerTransactions(user) {
 }
 app.get(["/xxapi/userinfo", "/userinfo"], async (req, res) => {
   try {
-    const user = await getUserByToken(req);
+    let user = await getUserByToken(req);
     if (!user) {
       return res.json({
         code: 403,
@@ -2534,6 +2544,27 @@ app.get(["/xxapi/userinfo", "/userinfo"], async (req, res) => {
     }
     if (needsSave) {
       await user.save();
+    }
+    try {
+      const uncreditedBuyTxs = await Transaction.find({
+        $or: [
+          { userId: user._id.toString() },
+          { buyerUserId: user._id.toString() },
+          { phone: user.phone },
+          { buyerPhone: user.phone }
+        ].filter(Boolean),
+        payer_status: 3,
+        isBalanceCredited: { $ne: true }
+      });
+      if (uncreditedBuyTxs && uncreditedBuyTxs.length > 0) {
+        for (const bTx of uncreditedBuyTxs) {
+          await ensureBuyerBalanceCredited(bTx, user);
+        }
+        const reloadedUser = await User.findById(user._id);
+        if (reloadedUser) user = reloadedUser;
+      }
+    } catch (txSyncErr) {
+      console.error("[User Info Sync Error]", txSyncErr);
     }
     const sellerTxs = await getUserSellerTransactions(user);
     let inTransation = 0;
