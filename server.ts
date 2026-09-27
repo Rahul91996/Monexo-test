@@ -745,24 +745,30 @@ async function calculateUserDailyData(user: any, startSec: number, endSec: numbe
       { buyerPhone: { $in: userPhones } }
     ],
     payer_status: 3,
-    type: { $in: ['recharge', 'buy', 'deposit', 'buyitoken'] },
+    type: { $ne: 'sell' },
     isAdminAddition: { $ne: true },
     rptNo: { $not: /^ADM/i },
-    reason_for_rejection: { $not: /Admin Balance|Newbie Reward|Invite Reward|Bonus/i },
-    ctime: { $gte: startSec, $lte: endSec }
+    reason_for_rejection: { $not: /Admin Balance|Newbie Reward|Invite Reward|Bonus/i }
   });
 
-  const times = buyTxs.length;
+  let times = 0;
   let recharge = 0;
   let reward = 0;
 
   for (const tx of buyTxs) {
-    const amt = Number(tx.amount) || 0;
-    recharge += amt;
-    const r = (tx as any).reward !== undefined && (tx as any).reward !== null && (tx as any).reward > 0
-      ? Number((tx as any).reward)
-      : Math.round((amt * 0.04) * 100) / 100;
-    reward += r;
+    let txSec = tx.ctime || 0;
+    if (txSec > 10000000000) txSec = Math.floor(txSec / 1000);
+    if (!txSec && tx.createdAt) txSec = Math.floor(new Date(tx.createdAt).getTime() / 1000);
+
+    if (txSec >= startSec && txSec <= endSec) {
+      times++;
+      const amt = Number(tx.amount) || 0;
+      recharge += amt;
+      const r = (tx as any).reward !== undefined && (tx as any).reward !== null && Number((tx as any).reward) > 0
+        ? Number((tx as any).reward)
+        : Math.round((amt * 0.04) * 100) / 100;
+      reward += r;
+    }
   }
   recharge = Math.round(recharge * 100) / 100;
   reward = Math.round(reward * 100) / 100;
@@ -2077,7 +2083,9 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
       {
         $inc: {
           balance: totalCredit,
-          recharge: amount
+          recharge: amount,
+          commission: reward4Pct,
+          todayProfit: reward4Pct
         }
       },
       { new: true }
@@ -2130,45 +2138,41 @@ async function getDistinctPayeeUpi(tx: any, buyerSelectedUpi: string, user: any)
     return false;
   };
 
-  let candidatePayee = (tx as any).receiverUpi || (tx as any).receiveAccount || (tx as any).payeeAccount || tx.payee_bank_account || tx.upi || "";
-  if (candidatePayee && !isBuyerUpi(candidatePayee)) {
-    return candidatePayee;
-  }
-
-  if (tx.rptNo && orderSlipMap.has(tx.rptNo)) {
-    const slip = orderSlipMap.get(tx.rptNo);
+  // 1. Check orderSlipMap for original seller/merchant slip UPI
+  const rptKey = tx?.rptNo || tx?.id || "";
+  const cleanRptKey = String(rptKey).replace(/^SELL_/i, '').trim();
+  if (cleanRptKey && orderSlipMap.has(cleanRptKey)) {
+    const slip = orderSlipMap.get(cleanRptKey);
     if (slip && slip.upi && !isBuyerUpi(slip.upi)) {
       return slip.upi;
     }
   }
 
-  if (tx.sellerId || tx.sellerPhone) {
+  // 2. Check sellerId or sellerPhone on transaction
+  if (tx && (tx.sellerId || tx.sellerPhone)) {
     const seller = await User.findOne({
       $or: [{ _id: tx.sellerId }, { phone: tx.sellerPhone }].filter(Boolean)
     });
-    if (seller && seller.collectionTools) {
+    if (seller && seller.collectionTools && Array.isArray(seller.collectionTools)) {
       const sTool = seller.collectionTools.find((t: any) => t && t.upi && !isBuyerUpi(t.upi));
-      if (sTool) return sTool.upi;
+      if (sTool && sTool.upi) return sTool.upi;
     }
   }
 
+  // 3. Check candidate properties on tx ONLY if NOT buyer's UPI (Exclude tx.upi!)
+  let candidatePayee = (tx as any).receiverUpi || (tx as any).receiveAccount || (tx as any).payeeAccount || tx.payee_bank_account || "";
+  if (candidatePayee && !isBuyerUpi(candidatePayee)) {
+    return candidatePayee;
+  }
+
+  // 4. Check active admin nodes
   const activeNode = await PaymentNode.findOne({ status: true });
   if (activeNode && activeNode.accountNumber && !isBuyerUpi(activeNode.accountNumber)) {
     return activeNode.accountNumber;
   }
 
-  // Check any other user's active collection tool as merchant payee
-  try {
-    const anySellingUser = await User.findOne({
-      'collectionTools.0': { $exists: true }
-    });
-    if (anySellingUser && anySellingUser.collectionTools) {
-      const sTool = anySellingUser.collectionTools.find((t: any) => t && t.upi && !isBuyerUpi(t.upi));
-      if (sTool) return sTool.upi;
-    }
-  } catch (e) {}
-
-  return "dhhrhdh@upi"; // Dedicated Merchant payee UPI fallback (NEVER return buyer's phone!)
+  // 5. Dedicated Merchant payee UPI fallback (NEVER return buyer's phone/UPI!)
+  return "dhhrhdh@upi";
 }
 
 // Serve uploaded support media statically
@@ -4602,18 +4606,17 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
       }
 
       const cachedRpt = cached?.rptNo || cached?.orderObj?.rptNo || "";
-      const isCancelledInDb = cachedRpt ? await Transaction.exists({
-        rptNo: { $in: [cachedRpt, `SELL_${cachedRpt}`, cachedRpt.replace(/^SELL_/i, '')] },
-        payer_status: { $in: [4, 5] }
-      }) : false;
-      const isCompletedInDb = cachedRpt ? await Transaction.exists({
-        rptNo: { $in: [cachedRpt, `SELL_${cachedRpt}`, cachedRpt.replace(/^SELL_/i, '')] },
-        payer_status: 3
+      const isPickedInDb = cachedRpt ? await Transaction.exists({
+        $or: [
+          { rptNo: { $in: [cachedRpt, `SELL_${cachedRpt}`, cachedRpt.replace(/^SELL_/i, '')] } },
+          { _id: isValidObjectId(cachedRpt) ? cachedRpt : null }
+        ].filter(Boolean),
+        payer_status: { $gte: 1 }
       }) : false;
       const isSlipCancelled = cachedRpt ? orderSlipMap.get(cachedRpt)?.payer_status === 4 : false;
       const isUserCancelled = cachedRpt ? (isOrderCancelledForUser(userPhone, cachedRpt) || (cached?.orderObj?.nodeId && isOrderCancelledForUser(userPhone, cached.orderObj.nodeId))) : false;
 
-      if (cached && !isCancelledInDb && !isCompletedInDb && !isSlipCancelled && !isUserCancelled && cached.createdAt && (Date.now() - cached.createdAt < 600000) && amountMatches) { // 10 min session
+      if (cached && !isPickedInDb && !isSlipCancelled && !isUserCancelled && cached.createdAt && (Date.now() - cached.createdAt < 600000) && amountMatches) { // 10 min session
         let isNodeStillActive = true;
         if (cached.orderObj?.isAdminNode || cached.orderObj?.nodeId || cached.slipItem?.nodeId) {
           const nId = cached.orderObj?.nodeId || cached.slipItem?.nodeId;

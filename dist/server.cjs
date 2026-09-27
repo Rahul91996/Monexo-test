@@ -701,20 +701,25 @@ async function calculateUserDailyData(user, startSec, endSec) {
       { buyerPhone: { $in: userPhones } }
     ],
     payer_status: 3,
-    type: { $in: ["recharge", "buy", "deposit", "buyitoken"] },
+    type: { $ne: "sell" },
     isAdminAddition: { $ne: true },
     rptNo: { $not: /^ADM/i },
-    reason_for_rejection: { $not: /Admin Balance|Newbie Reward|Invite Reward|Bonus/i },
-    ctime: { $gte: startSec, $lte: endSec }
+    reason_for_rejection: { $not: /Admin Balance|Newbie Reward|Invite Reward|Bonus/i }
   });
-  const times = buyTxs.length;
+  let times = 0;
   let recharge = 0;
   let reward = 0;
   for (const tx of buyTxs) {
-    const amt = Number(tx.amount) || 0;
-    recharge += amt;
-    const r = tx.reward !== void 0 && tx.reward !== null && tx.reward > 0 ? Number(tx.reward) : Math.round(amt * 0.04 * 100) / 100;
-    reward += r;
+    let txSec = tx.ctime || 0;
+    if (txSec > 1e10) txSec = Math.floor(txSec / 1e3);
+    if (!txSec && tx.createdAt) txSec = Math.floor(new Date(tx.createdAt).getTime() / 1e3);
+    if (txSec >= startSec && txSec <= endSec) {
+      times++;
+      const amt = Number(tx.amount) || 0;
+      recharge += amt;
+      const r = tx.reward !== void 0 && tx.reward !== null && Number(tx.reward) > 0 ? Number(tx.reward) : Math.round(amt * 0.04 * 100) / 100;
+      reward += r;
+    }
   }
   recharge = Math.round(recharge * 100) / 100;
   reward = Math.round(reward * 100) / 100;
@@ -1723,7 +1728,9 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
       {
         $inc: {
           balance: totalCredit,
-          recharge: amount
+          recharge: amount,
+          commission: reward4Pct,
+          todayProfit: reward4Pct
         }
       },
       { new: true }
@@ -1770,38 +1777,30 @@ async function getDistinctPayeeUpi(tx, buyerSelectedUpi, user) {
     }
     return false;
   };
-  let candidatePayee = tx.receiverUpi || tx.receiveAccount || tx.payeeAccount || tx.payee_bank_account || tx.upi || "";
-  if (candidatePayee && !isBuyerUpi(candidatePayee)) {
-    return candidatePayee;
-  }
-  if (tx.rptNo && orderSlipMap.has(tx.rptNo)) {
-    const slip = orderSlipMap.get(tx.rptNo);
+  const rptKey = tx?.rptNo || tx?.id || "";
+  const cleanRptKey = String(rptKey).replace(/^SELL_/i, "").trim();
+  if (cleanRptKey && orderSlipMap.has(cleanRptKey)) {
+    const slip = orderSlipMap.get(cleanRptKey);
     if (slip && slip.upi && !isBuyerUpi(slip.upi)) {
       return slip.upi;
     }
   }
-  if (tx.sellerId || tx.sellerPhone) {
+  if (tx && (tx.sellerId || tx.sellerPhone)) {
     const seller = await User.findOne({
       $or: [{ _id: tx.sellerId }, { phone: tx.sellerPhone }].filter(Boolean)
     });
-    if (seller && seller.collectionTools) {
+    if (seller && seller.collectionTools && Array.isArray(seller.collectionTools)) {
       const sTool = seller.collectionTools.find((t) => t && t.upi && !isBuyerUpi(t.upi));
-      if (sTool) return sTool.upi;
+      if (sTool && sTool.upi) return sTool.upi;
     }
+  }
+  let candidatePayee = tx.receiverUpi || tx.receiveAccount || tx.payeeAccount || tx.payee_bank_account || "";
+  if (candidatePayee && !isBuyerUpi(candidatePayee)) {
+    return candidatePayee;
   }
   const activeNode = await PaymentNode.findOne({ status: true });
   if (activeNode && activeNode.accountNumber && !isBuyerUpi(activeNode.accountNumber)) {
     return activeNode.accountNumber;
-  }
-  try {
-    const anySellingUser = await User.findOne({
-      "collectionTools.0": { $exists: true }
-    });
-    if (anySellingUser && anySellingUser.collectionTools) {
-      const sTool = anySellingUser.collectionTools.find((t) => t && t.upi && !isBuyerUpi(t.upi));
-      if (sTool) return sTool.upi;
-    }
-  } catch (e) {
   }
   return "dhhrhdh@upi";
 }
@@ -3894,17 +3893,16 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
         if (cachedAmt < minAmt || cachedAmt > maxAmt) amountMatches = false;
       }
       const cachedRpt = cached?.rptNo || cached?.orderObj?.rptNo || "";
-      const isCancelledInDb = cachedRpt ? await Transaction.exists({
-        rptNo: { $in: [cachedRpt, `SELL_${cachedRpt}`, cachedRpt.replace(/^SELL_/i, "")] },
-        payer_status: { $in: [4, 5] }
-      }) : false;
-      const isCompletedInDb = cachedRpt ? await Transaction.exists({
-        rptNo: { $in: [cachedRpt, `SELL_${cachedRpt}`, cachedRpt.replace(/^SELL_/i, "")] },
-        payer_status: 3
+      const isPickedInDb = cachedRpt ? await Transaction.exists({
+        $or: [
+          { rptNo: { $in: [cachedRpt, `SELL_${cachedRpt}`, cachedRpt.replace(/^SELL_/i, "")] } },
+          { _id: isValidObjectId(cachedRpt) ? cachedRpt : null }
+        ].filter(Boolean),
+        payer_status: { $gte: 1 }
       }) : false;
       const isSlipCancelled = cachedRpt ? orderSlipMap.get(cachedRpt)?.payer_status === 4 : false;
       const isUserCancelled = cachedRpt ? isOrderCancelledForUser(userPhone2, cachedRpt) || cached?.orderObj?.nodeId && isOrderCancelledForUser(userPhone2, cached.orderObj.nodeId) : false;
-      if (cached && !isCancelledInDb && !isCompletedInDb && !isSlipCancelled && !isUserCancelled && cached.createdAt && Date.now() - cached.createdAt < 6e5 && amountMatches) {
+      if (cached && !isPickedInDb && !isSlipCancelled && !isUserCancelled && cached.createdAt && Date.now() - cached.createdAt < 6e5 && amountMatches) {
         let isNodeStillActive = true;
         if (cached.orderObj?.isAdminNode || cached.orderObj?.nodeId || cached.slipItem?.nodeId) {
           const nId = cached.orderObj?.nodeId || cached.slipItem?.nodeId;
