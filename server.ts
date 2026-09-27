@@ -5064,7 +5064,10 @@ app.get('/xxapi/buyitoken/paymentslipdetail', async (req, res) => {
       "Order status": currentPayerStatus === 3 ? "Success" : currentPayerStatus === 4 ? "Cancelled" : currentPayerStatus === 1 ? "Paying" : "In Review",
       orderStatus: currentPayerStatus === 3 ? "Success" : currentPayerStatus === 4 ? "Cancelled" : currentPayerStatus === 1 ? "Paying" : "In Review",
       "Finish time": (function() {
-        const fnsSec = tx ? ((tx as any).finishTime || (tx as any).fnsDate || 0) : 0;
+        let fnsSec = tx ? ((tx as any).finishTime || (tx as any).fnsDate || 0) : 0;
+        if (!fnsSec && currentPayerStatus === 3) {
+          fnsSec = tx ? ((tx as any).dealTime || tx.ctime) : Math.floor(Date.now() / 1000);
+        }
         if (!fnsSec) return "";
         const d = new Date((fnsSec > 10000000000 ? Math.floor(fnsSec / 1000) : fnsSec) * 1000);
         return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
@@ -8122,14 +8125,42 @@ app.post('/xxapi/monitorflow/three', async (req, res) => {
               await counterpartTx.save();
             }
 
-            // Credit buyer balance and recharge
-            const reward4Pct = Math.round(((tx.amount || 0) * 0.04) * 100) / 100;
-            tx.reward = reward4Pct;
-            await tx.save().catch(() => {});
-            user.balance = Math.round(((user.balance || 0) + (tx.amount || 0) + reward4Pct) * 100) / 100;
-            user.recharge = Math.round(((user.recharge || 0) + (tx.amount || 0)) * 100) / 100;
-            await user.save();
-            await distributeTeamCommission(user, tx.amount || 0).catch(() => {});
+            // Credit buyer balance and recharge (+ 4% reward)
+            const buyer = await User.findOne({
+              $or: [
+                { _id: tx.buyerUserId },
+                { _id: tx.userId },
+                { phone: tx.buyerPhone },
+                { phone: tx.phone },
+                { mobileNo: tx.buyerPhone },
+                { mobileNo: tx.phone }
+              ].filter(Boolean)
+            });
+
+            if (buyer) {
+              const reward4Pct = Math.round(((tx.amount || 0) * 0.04) * 100) / 100;
+              tx.reward = reward4Pct;
+              await tx.save().catch(() => {});
+              buyer.balance = Math.round(((buyer.balance || 0) + (tx.amount || 0) + reward4Pct) * 100) / 100;
+              buyer.recharge = Math.round(((buyer.recharge || 0) + (tx.amount || 0)) * 100) / 100;
+              await buyer.save();
+              await distributeTeamCommission(buyer, tx.amount || 0).catch(() => {});
+              console.log(`[Order Review Approved] Buyer ${buyer.phone} wallet credited +₹${tx.amount} + ₹${reward4Pct} (4% reward). New Balance: ₹${buyer.balance}`);
+            }
+
+            // Debit seller balance if seller present
+            const sellerIdVal = tx.sellerId;
+            const sellerPhoneVal = tx.sellerPhone;
+            if (sellerIdVal || sellerPhoneVal) {
+              const sellerObj = await User.findOne({
+                $or: [{ _id: sellerIdVal }, { phone: sellerPhoneVal }].filter(Boolean)
+              });
+              if (sellerObj) {
+                sellerObj.balance = Math.max(0, (sellerObj.balance || 0) - (tx.amount || 0));
+                await sellerObj.save();
+                console.log(`[Order Review Approved] Seller ${sellerObj.phone} wallet debited -₹${tx.amount}. New Balance: ₹${sellerObj.balance}`);
+              }
+            }
             
             console.log(`[Instant History Sync] Pending order ${tx.rptNo} MATCHED with UTR "${tx.utr}" from ${checkPhone} history! Marked SUCCESS.`);
             matchedOrder = tx;
@@ -8377,7 +8408,16 @@ app.get('/xxapi/chargeUtr/:rptNo/:utr', async (req, res) => {
   await tx.save();
   
   // 1. Instant local credit to buyer balance (+ 4% buy reward)
-  const buyer = await User.findOne({ phone: tx.phone });
+  const buyer = await User.findOne({
+    $or: [
+      { _id: tx.buyerUserId },
+      { _id: tx.userId },
+      { phone: tx.buyerPhone },
+      { phone: tx.phone },
+      { mobileNo: tx.buyerPhone },
+      { mobileNo: tx.phone }
+    ].filter(Boolean)
+  });
   if (buyer) {
     const reward4Pct = Math.round(((tx.amount || 0) * 0.04) * 100) / 100;
     tx.reward = reward4Pct;
@@ -12704,8 +12744,11 @@ app.post('/xxapi/admin/updateOrderStatus', requireAdmin, async (req, res) => {
         // 1. Buyer Balance Credit & Recharge sync
         const buyer = await User.findOne({
           $or: [
+            { _id: tx.buyerUserId },
             { _id: tx.userId },
+            { phone: tx.buyerPhone },
             { phone: tx.phone },
+            { mobileNo: tx.buyerPhone },
             { mobileNo: tx.phone }
           ].filter(Boolean)
         });

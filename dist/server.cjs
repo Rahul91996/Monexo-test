@@ -4302,7 +4302,10 @@ app.get("/xxapi/buyitoken/paymentslipdetail", async (req, res) => {
       "Order status": currentPayerStatus === 3 ? "Success" : currentPayerStatus === 4 ? "Cancelled" : currentPayerStatus === 1 ? "Paying" : "In Review",
       orderStatus: currentPayerStatus === 3 ? "Success" : currentPayerStatus === 4 ? "Cancelled" : currentPayerStatus === 1 ? "Paying" : "In Review",
       "Finish time": (function() {
-        const fnsSec = tx ? tx.finishTime || tx.fnsDate || 0 : 0;
+        let fnsSec = tx ? tx.finishTime || tx.fnsDate || 0 : 0;
+        if (!fnsSec && currentPayerStatus === 3) {
+          fnsSec = tx ? tx.dealTime || tx.ctime : Math.floor(Date.now() / 1e3);
+        }
         if (!fnsSec) return "";
         const d = new Date((fnsSec > 1e10 ? Math.floor(fnsSec / 1e3) : fnsSec) * 1e3);
         return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
@@ -6932,15 +6935,40 @@ app.post("/xxapi/monitorflow/three", async (req, res) => {
               counterpartTx.currentStep = 2;
               await counterpartTx.save();
             }
-            const reward4Pct = Math.round((tx.amount || 0) * 0.04 * 100) / 100;
-            tx.reward = reward4Pct;
-            await tx.save().catch(() => {
+            const buyer = await User.findOne({
+              $or: [
+                { _id: tx.buyerUserId },
+                { _id: tx.userId },
+                { phone: tx.buyerPhone },
+                { phone: tx.phone },
+                { mobileNo: tx.buyerPhone },
+                { mobileNo: tx.phone }
+              ].filter(Boolean)
             });
-            user.balance = Math.round(((user.balance || 0) + (tx.amount || 0) + reward4Pct) * 100) / 100;
-            user.recharge = Math.round(((user.recharge || 0) + (tx.amount || 0)) * 100) / 100;
-            await user.save();
-            await distributeTeamCommission(user, tx.amount || 0).catch(() => {
-            });
+            if (buyer) {
+              const reward4Pct = Math.round((tx.amount || 0) * 0.04 * 100) / 100;
+              tx.reward = reward4Pct;
+              await tx.save().catch(() => {
+              });
+              buyer.balance = Math.round(((buyer.balance || 0) + (tx.amount || 0) + reward4Pct) * 100) / 100;
+              buyer.recharge = Math.round(((buyer.recharge || 0) + (tx.amount || 0)) * 100) / 100;
+              await buyer.save();
+              await distributeTeamCommission(buyer, tx.amount || 0).catch(() => {
+              });
+              console.log(`[Order Review Approved] Buyer ${buyer.phone} wallet credited +\u20B9${tx.amount} + \u20B9${reward4Pct} (4% reward). New Balance: \u20B9${buyer.balance}`);
+            }
+            const sellerIdVal = tx.sellerId;
+            const sellerPhoneVal = tx.sellerPhone;
+            if (sellerIdVal || sellerPhoneVal) {
+              const sellerObj = await User.findOne({
+                $or: [{ _id: sellerIdVal }, { phone: sellerPhoneVal }].filter(Boolean)
+              });
+              if (sellerObj) {
+                sellerObj.balance = Math.max(0, (sellerObj.balance || 0) - (tx.amount || 0));
+                await sellerObj.save();
+                console.log(`[Order Review Approved] Seller ${sellerObj.phone} wallet debited -\u20B9${tx.amount}. New Balance: \u20B9${sellerObj.balance}`);
+              }
+            }
             console.log(`[Instant History Sync] Pending order ${tx.rptNo} MATCHED with UTR "${tx.utr}" from ${checkPhone} history! Marked SUCCESS.`);
             matchedOrder = tx;
             break;
@@ -7147,7 +7175,16 @@ app.get("/xxapi/chargeUtr/:rptNo/:utr", async (req, res) => {
   tx.currentStep = 2;
   tx.payer_status = 3;
   await tx.save();
-  const buyer = await User.findOne({ phone: tx.phone });
+  const buyer = await User.findOne({
+    $or: [
+      { _id: tx.buyerUserId },
+      { _id: tx.userId },
+      { phone: tx.buyerPhone },
+      { phone: tx.phone },
+      { mobileNo: tx.buyerPhone },
+      { mobileNo: tx.phone }
+    ].filter(Boolean)
+  });
   if (buyer) {
     const reward4Pct = Math.round((tx.amount || 0) * 0.04 * 100) / 100;
     tx.reward = reward4Pct;
@@ -10872,8 +10909,11 @@ app.post("/xxapi/admin/updateOrderStatus", requireAdmin, async (req, res) => {
       if (previousStatus !== 3) {
         const buyer = await User.findOne({
           $or: [
+            { _id: tx.buyerUserId },
             { _id: tx.userId },
+            { phone: tx.buyerPhone },
             { phone: tx.phone },
+            { mobileNo: tx.buyerPhone },
             { mobileNo: tx.phone }
           ].filter(Boolean)
         });
