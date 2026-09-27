@@ -3898,9 +3898,13 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
         rptNo: { $in: [cachedRpt, `SELL_${cachedRpt}`, cachedRpt.replace(/^SELL_/i, "")] },
         payer_status: { $in: [4, 5] }
       }) : false;
+      const isCompletedInDb = cachedRpt ? await Transaction.exists({
+        rptNo: { $in: [cachedRpt, `SELL_${cachedRpt}`, cachedRpt.replace(/^SELL_/i, "")] },
+        payer_status: 3
+      }) : false;
       const isSlipCancelled = cachedRpt ? orderSlipMap.get(cachedRpt)?.payer_status === 4 : false;
       const isUserCancelled = cachedRpt ? isOrderCancelledForUser(userPhone2, cachedRpt) || cached?.orderObj?.nodeId && isOrderCancelledForUser(userPhone2, cached.orderObj.nodeId) : false;
-      if (cached && !isCancelledInDb && !isSlipCancelled && !isUserCancelled && cached.createdAt && Date.now() - cached.createdAt < 6e5 && amountMatches) {
+      if (cached && !isCancelledInDb && !isCompletedInDb && !isSlipCancelled && !isUserCancelled && cached.createdAt && Date.now() - cached.createdAt < 6e5 && amountMatches) {
         let isNodeStillActive = true;
         if (cached.orderObj?.isAdminNode || cached.orderObj?.nodeId || cached.slipItem?.nodeId) {
           const nId = cached.orderObj?.nodeId || cached.slipItem?.nodeId;
@@ -7740,7 +7744,8 @@ async function getRechargeHistory(req, res) {
       "Kyc Partner": partnerNameVal,
       kycPartner: partnerNameVal,
       kyc_partner: partnerNameVal,
-      // PAYEE UPI (jisko payment karna hai)
+      // PAYEE / RECEIVER UPI (jisko payment karna hai)
+      "Receiver Upi": payeeUpi,
       "Payee Upi": payeeUpi,
       payeeUpi,
       payee_bank_account: payeeUpi,
@@ -7748,6 +7753,7 @@ async function getRechargeHistory(req, res) {
       receiveAccount: payeeUpi,
       payeeAccount: payeeUpi,
       receiverUpi: payeeUpi,
+      receiver_upi: payeeUpi,
       // UTR & STATUS
       "Utr": tx.utr || tx.ref_no || "",
       utr: tx.utr || tx.ref_no || "",
