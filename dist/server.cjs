@@ -1696,9 +1696,11 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
   if (amount <= 0) return false;
   const reward4Pct = Math.round(amount * 0.04 * 100) / 100;
   const totalCredit = Math.round((amount + reward4Pct) * 100) / 100;
+  await Transaction.updateOne({ _id: tx._id }, { $set: { payer_status: 3 } }).catch(() => {
+  });
   const updatedTx = await Transaction.findOneAndUpdate(
-    { _id: tx._id, isBalanceCredited: { $ne: true }, payer_status: 3 },
-    { $set: { isBalanceCredited: true, reward: reward4Pct } },
+    { _id: tx._id, isBalanceCredited: { $ne: true } },
+    { $set: { isBalanceCredited: true, payer_status: 3, reward: reward4Pct } },
     { new: true }
   );
   if (!updatedTx) {
@@ -7731,7 +7733,6 @@ async function getRechargeHistory(req, res) {
       upi_id: buyerSelectedUpi,
       upi: buyerSelectedUpi,
       account: buyerSelectedUpi,
-      acctNo: buyerSelectedUpi,
       payAccount: buyerSelectedUpi,
       payer_upi: buyerSelectedUpi,
       ctAccount: buyerSelectedUpi,
@@ -7752,6 +7753,8 @@ async function getRechargeHistory(req, res) {
       payeeAccount: payeeUpi,
       receiverUpi: payeeUpi,
       receiver_upi: payeeUpi,
+      acctNo: payeeUpi,
+      pnaccount: payeeUpi,
       // UTR & STATUS
       "Utr": tx.utr || tx.ref_no || "",
       utr: tx.utr || tx.ref_no || "",

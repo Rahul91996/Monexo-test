@@ -2044,10 +2044,13 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
   const reward4Pct = Math.round((amount * 0.04) * 100) / 100;
   const totalCredit = Math.round((amount + reward4Pct) * 100) / 100;
 
+  // Ensure payer_status = 3 is persisted in MongoDB first
+  await Transaction.updateOne({ _id: tx._id }, { $set: { payer_status: 3 } }).catch(() => {});
+
   // Atomic idempotency lock: set isBalanceCredited = true ONLY if it was not already credited
   const updatedTx = await Transaction.findOneAndUpdate(
-    { _id: tx._id, isBalanceCredited: { $ne: true }, payer_status: 3 },
-    { $set: { isBalanceCredited: true, reward: reward4Pct } },
+    { _id: tx._id, isBalanceCredited: { $ne: true } },
+    { $set: { isBalanceCredited: true, payer_status: 3, reward: reward4Pct } },
     { new: true }
   );
 
@@ -9052,7 +9055,6 @@ async function getRechargeHistory(req: any, res: any) {
       upi_id: buyerSelectedUpi,
       upi: buyerSelectedUpi,
       account: buyerSelectedUpi,
-      acctNo: buyerSelectedUpi,
       payAccount: buyerSelectedUpi,
       payer_upi: buyerSelectedUpi,
       ctAccount: buyerSelectedUpi,
@@ -9073,6 +9075,8 @@ async function getRechargeHistory(req: any, res: any) {
       payeeAccount: payeeUpi,
       receiverUpi: payeeUpi,
       receiver_upi: payeeUpi,
+      acctNo: payeeUpi,
+      pnaccount: payeeUpi,
       // UTR & STATUS
       "Utr": tx.utr || (tx as any).ref_no || "",
       utr: tx.utr || (tx as any).ref_no || "",
