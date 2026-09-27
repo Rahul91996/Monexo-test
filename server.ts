@@ -8621,45 +8621,17 @@ app.get('/xxapi/chargeUtr/:rptNo/:utr', async (req, res) => {
   
   tx.utr = utr;
   tx.currentStep = 2; // review step
-  tx.payer_status = 3; // Success! Auto-approve for seamless money rotation
+  tx.payer_status = 2; // In Review (Pending Admin / Automation verification)
   await tx.save();
   
-  // 1. Instant local credit to buyer balance (+ 4% buy reward) & team commissions
-  await ensureBuyerBalanceCredited(tx);
+  // Clear buyer active order map so order leaves buy page immediately
+  buyerActiveOrderMap.clear();
 
-  // 2. Instant debit to seller balance & record sell transaction for seller
-  const sellerId = (tx as any).sellerId;
-  if (sellerId) {
-    try {
-      const seller = await User.findById(sellerId);
-      if (seller) {
-        await User.findByIdAndUpdate(seller._id, { $inc: { balance: -Math.abs(tx.amount || 0) } });
-        console.log(`[Money Rotation] Seller ${seller.phone} wallet debited -${tx.amount}.`);
-
-        // Record completed sell transaction for seller
-        const sellRptNo = `SELL_${tx.rptNo}`;
-        const existingSellTx = await Transaction.findOne({ rptNo: sellRptNo });
-        if (!existingSellTx) {
-          const sellTx = new Transaction({
-            userId: seller._id,
-            phone: seller.phone,
-            rptNo: sellRptNo,
-            amount: tx.amount,
-            payer_status: 3, // Success
-            type: 'sell',
-            payee_bank_account: tx.payee_bank_account,
-            payee_recipients_name: tx.payee_recipients_name,
-            ctime: Math.floor(Date.now() / 1000)
-          });
-          await sellTx.save();
-        }
-      }
-    } catch (err) {
-      console.error('[Money Rotation] Error debiting seller or saving sell transaction:', err);
-    }
-  }
-  
-  return res.json({ code: 0, msg: 'success', data: tx });
+  return res.json({
+    code: 0,
+    msg: 'UTR submitted successfully. Order is under review.',
+    data: tx
+  });
 });
 
 async function cancelTransactionHandler(req: any, res: any) {
