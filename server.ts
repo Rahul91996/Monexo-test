@@ -2039,44 +2039,33 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
   const isSuccess = tx.payer_status === 3 || String(tx.orderStateText || '').toLowerCase().includes('success') || String(tx.statusText || '').toLowerCase().includes('success');
   if (!isSuccess) return false;
 
-  const amount = Number(tx.amount || 0);
+  // Check idempotency first in DB
+  const dbTx = await Transaction.findById(tx._id).catch(() => null);
+  if (!dbTx || dbTx.isBalanceCredited === true) {
+    return false; // Already credited!
+  }
+
+  const amount = Number(tx.amount || dbTx.amount || 0);
   if (amount <= 0) return false;
   const reward4Pct = Math.round((amount * 0.04) * 100) / 100;
   const totalCredit = Math.round((amount + reward4Pct) * 100) / 100;
 
-  // Ensure payer_status = 3 is persisted in MongoDB first
-  await Transaction.updateOne({ _id: tx._id }, { $set: { payer_status: 3 } }).catch(() => {});
-
-  // Atomic idempotency lock: set isBalanceCredited = true ONLY if it was not already credited
-  const updatedTx = await Transaction.findOneAndUpdate(
-    { _id: tx._id, isBalanceCredited: { $ne: true } },
-    { $set: { isBalanceCredited: true, payer_status: 3, reward: reward4Pct } },
-    { new: true }
-  );
-
-  if (!updatedTx) {
-    return false; // Already credited or not status 3!
-  }
-
-  // Update local memory properties
-  tx.isBalanceCredited = true;
-  tx.reward = reward4Pct;
-
-  let buyerId = tx.buyerUserId || tx.userId;
+  // Find buyer safely
+  let buyerId = tx.buyerUserId || tx.userId || dbTx.buyerUserId || dbTx.userId;
   let buyer = fallbackUser;
-  if (!buyer && buyerId) {
-    buyer = await User.findById(buyerId);
+
+  if (!buyer && buyerId && isValidObjectId(buyerId)) {
+    buyer = await User.findById(buyerId).catch(() => null);
   }
-  if (!buyer) {
+
+  const buyerPhones = [tx.buyerPhone, tx.phone, dbTx.buyerPhone, dbTx.phone].filter(Boolean);
+  if (!buyer && buyerPhones.length > 0) {
     buyer = await User.findOne({
       $or: [
-        { _id: buyerId },
-        { phone: tx.buyerPhone },
-        { phone: tx.phone },
-        { mobileNo: tx.buyerPhone },
-        { mobileNo: tx.phone }
-      ].filter(Boolean)
-    });
+        { phone: { $in: buyerPhones } },
+        { mobileNo: { $in: buyerPhones } }
+      ]
+    }).catch(() => null);
   }
 
   if (buyer) {
@@ -2094,9 +2083,26 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
       { new: true }
     );
 
+    // Atomically mark transaction as credited
+    await Transaction.updateOne(
+      { _id: tx._id, isBalanceCredited: { $ne: true } },
+      { $set: { isBalanceCredited: true, payer_status: 3, reward: reward4Pct } }
+    );
+
+    tx.isBalanceCredited = true;
+    tx.reward = reward4Pct;
+    tx.payer_status = 3;
+
     if (updatedBuyer) {
-      await distributeTeamCommission(updatedBuyer, amount, updatedTx._id).catch(() => {});
+      if (fallbackUser && fallbackUser._id && fallbackUser._id.toString() === updatedBuyer._id.toString()) {
+        fallbackUser.balance = updatedBuyer.balance;
+        fallbackUser.recharge = updatedBuyer.recharge;
+        fallbackUser.commission = updatedBuyer.commission;
+        fallbackUser.todayProfit = updatedBuyer.todayProfit;
+      }
+      await distributeTeamCommission(updatedBuyer, amount, tx._id).catch(() => {});
       console.log(`[INSTANT WALLET CREDIT +4%] Buyer ${updatedBuyer.phone} credited +₹${amount} + ₹${reward4Pct} (4% reward). Total: ₹${totalCredit}. New Balance: ₹${updatedBuyer.balance}`);
+      buyerActiveOrderMap.clear();
       return true;
     }
   }
@@ -12180,25 +12186,38 @@ app.get('/xxapi/admin/nodes', requireAdmin, async (req, res) => {
     const enrichedNodes = await Promise.all(nodes.map(async (n: any) => {
       let state = n.orderState || 'ACTIVE';
       let remainingSeconds = 0;
-      if (n.displayEndTime) {
-        const diffMs = new Date(n.displayEndTime).getTime() - now;
-        remainingSeconds = Math.max(0, Math.floor(diffMs / 1000));
-        if (state === 'ACTIVE' && remainingSeconds <= 0) {
-          state = 'EXPIRED';
-          await PaymentNode.updateOne({ _id: n._id }, { orderState: 'EXPIRED' });
-        }
-      }
 
       let txUtr = n.utr || '';
+      let buyerPhone = n.claimedByPhone || '';
+
       if (n.claimedRptNo) {
         const tx = await Transaction.findOne({ rptNo: n.claimedRptNo });
         if (tx) {
           if (tx.utr) txUtr = tx.utr;
-          if (tx.payer_status === 3 && state !== 'COMPLETED') {
+          if (tx.phone) buyerPhone = tx.phone;
+          if (tx.payer_status === 3) {
             state = 'COMPLETED';
-            await PaymentNode.updateOne({ _id: n._id }, { orderState: 'COMPLETED', utr: txUtr });
+            await PaymentNode.updateOne({ _id: n._id }, { orderState: 'COMPLETED', utr: txUtr }).catch(() => {});
+          } else if (tx.payer_status === 1 || tx.payer_status === 2 || tx.payer_status === 0) {
+            state = 'CLAIMED';
+            if (n.orderState !== 'CLAIMED' || n.status !== false) {
+              await PaymentNode.updateOne({ _id: n._id }, { status: false, orderState: 'CLAIMED' }).catch(() => {});
+            }
+          } else if (tx.payer_status === 4 || tx.payer_status === 5) {
+            state = 'CANCELLED';
           }
         }
+      }
+
+      if (state === 'ACTIVE' && n.displayEndTime) {
+        const diffMs = new Date(n.displayEndTime).getTime() - now;
+        remainingSeconds = Math.max(0, Math.floor(diffMs / 1000));
+        if (remainingSeconds <= 0) {
+          state = 'EXPIRED';
+          await PaymentNode.updateOne({ _id: n._id }, { orderState: 'EXPIRED' }).catch(() => {});
+        }
+      } else {
+        remainingSeconds = 0; // Expiry timer stops completely when CLAIMED/COMPLETED/CANCELLED!
       }
 
       let vName = n.name;
@@ -12209,6 +12228,7 @@ app.get('/xxapi/admin/nodes', requireAdmin, async (req, res) => {
       return {
         ...n,
         orderState: state,
+        claimedByPhone: buyerPhone || n.claimedByPhone || '',
         remainingSeconds,
         utr: txUtr,
         verifiedName: vName
@@ -12233,35 +12253,46 @@ app.get('/xxapi/admin/nodeHistory', requireAdmin, async (req: any, res: any) => 
     const enrichedHistory = await Promise.all(nodes.map(async (n: any) => {
       let state = n.orderState || 'ACTIVE';
       let remainingSeconds = 0;
-      if (n.displayEndTime) {
-        const diffMs = new Date(n.displayEndTime).getTime() - now;
-        remainingSeconds = Math.max(0, Math.floor(diffMs / 1000));
-        if (state === 'ACTIVE' && remainingSeconds <= 0) {
-          state = 'EXPIRED';
-          await PaymentNode.updateOne({ _id: n._id }, { orderState: 'EXPIRED' });
-        }
-      }
 
       let txUtr = n.utr || '';
       let buyerPhone = n.claimedByPhone || '';
+
       if (n.claimedRptNo) {
         const tx = await Transaction.findOne({ rptNo: n.claimedRptNo });
         if (tx) {
           if (tx.utr) txUtr = tx.utr;
           if (tx.phone) buyerPhone = tx.phone;
-          if (tx.payer_status === 3 && state !== 'COMPLETED') {
+          if (tx.payer_status === 3) {
             state = 'COMPLETED';
-            await PaymentNode.updateOne({ _id: n._id }, { orderState: 'COMPLETED', utr: txUtr });
+            await PaymentNode.updateOne({ _id: n._id }, { orderState: 'COMPLETED', utr: txUtr }).catch(() => {});
+          } else if (tx.payer_status === 1 || tx.payer_status === 2 || tx.payer_status === 0) {
+            state = 'CLAIMED';
+            if (n.orderState !== 'CLAIMED' || n.status !== false) {
+              await PaymentNode.updateOne({ _id: n._id }, { status: false, orderState: 'CLAIMED' }).catch(() => {});
+            }
+          } else if (tx.payer_status === 4 || tx.payer_status === 5) {
+            state = 'CANCELLED';
           }
         }
+      }
+
+      if (state === 'ACTIVE' && n.displayEndTime) {
+        const diffMs = new Date(n.displayEndTime).getTime() - now;
+        remainingSeconds = Math.max(0, Math.floor(diffMs / 1000));
+        if (remainingSeconds <= 0) {
+          state = 'EXPIRED';
+          await PaymentNode.updateOne({ _id: n._id }, { orderState: 'EXPIRED' }).catch(() => {});
+        }
+      } else {
+        remainingSeconds = 0; // Expiry timer stops completely when CLAIMED/COMPLETED/CANCELLED!
       }
 
       return {
         ...n,
         orderState: state,
+        claimedByPhone: buyerPhone || n.claimedByPhone || '',
         remainingSeconds,
         utr: txUtr,
-        claimedByPhone: buyerPhone,
         displayEndTimeFormatted: n.displayEndTime ? new Date(n.displayEndTime).toLocaleString() : ''
       };
     }));
