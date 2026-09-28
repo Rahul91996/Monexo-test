@@ -1803,6 +1803,11 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
     });
     console.log(`[INSTANT WALLET CREDIT +4% x1] Buyer ${updatedBuyer.phone} credited +\u20B9${amount} + \u20B9${reward4Pct} (4% reward). Total: \u20B9${totalCredit}. New Balance: \u20B9${updatedBuyer.balance}`);
     buyerActiveOrderMap.clear();
+    await PaymentNode.updateOne(
+      { $or: [{ claimedRptNo: claimedTx.rptNo }, { accountNumber: claimedTx.payee_bank_account }] },
+      { $set: { orderState: "COMPLETED" } }
+    ).catch(() => {
+    });
     return true;
   } catch (err) {
     if (useSession && session) {
@@ -4033,6 +4038,21 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
           continue;
         }
       }
+      if (node.claimedRptNo || node.accountNumber) {
+        const linkedTx = await Transaction.findOne({
+          $or: [
+            { rptNo: node.claimedRptNo },
+            { payee_bank_account: node.accountNumber }
+          ].filter(Boolean),
+          payer_status: { $in: [1, 2, 3] }
+        }).lean();
+        if (linkedTx) {
+          node.orderState = linkedTx.payer_status === 3 ? "COMPLETED" : "CLAIMED";
+          await node.save().catch(() => {
+          });
+          continue;
+        }
+      }
       const nodeIdStr = node._id.toString();
       if (userPhone2 && (isOrderCancelledForUser(userPhone2, nodeIdStr) || isOrderCancelledForUser(userPhone2, node.claimedRptNo))) {
         continue;
@@ -4049,6 +4069,14 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
       const rptNo = node.claimedRptNo;
       const methodVal = node.type === "upi" ? 1 : 2;
       const nodeCtType = reqCtType || 1;
+      const nodeCtime = Math.floor(new Date(node.createdAt || Date.now()).getTime() / 1e3);
+      let remainingSecs = node.displayDuration || 300;
+      let displayEndTimeIso = "";
+      if (node.displayEndTime) {
+        const endMs = new Date(node.displayEndTime).getTime();
+        remainingSecs = Math.max(0, Math.floor((endMs - nowMs) / 1e3));
+        displayEndTimeIso = new Date(node.displayEndTime).toISOString();
+      }
       const slipItem = {
         rptNo,
         amount: node.amount,
@@ -4056,7 +4084,7 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
         ctType: nodeCtType,
         upi: node.accountNumber,
         pnname: node.name,
-        ctime: Math.floor(new Date(node.createdAt || Date.now()).getTime() / 1e3)
+        ctime: nodeCtime
       };
       slipItem.isAdminNode = true;
       slipItem.nodeId = node._id.toString();
@@ -4079,7 +4107,11 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
         name: node.name,
         account_name: node.name,
         isAdminNode: true,
-        nodeId: node._id.toString()
+        nodeId: node._id.toString(),
+        ctime: nodeCtime,
+        displayEndTime: displayEndTimeIso,
+        remainingSeconds: remainingSecs,
+        displayDuration: node.displayDuration || 300
       });
     }
     {
@@ -4978,6 +5010,19 @@ app.post("/xxapi/buyitoken/pickuppaymentslip", async (req, res) => {
       console.error("Error creating seller counterpart tx:", sellTxErr);
     }
   }
+  if (isAdminOrder || payee_bank_account) {
+    const nId = slipData ? slipData.nodeId : null;
+    const nodeFilter = nId ? { _id: nId } : { status: true, accountNumber: payee_bank_account };
+    await PaymentNode.updateOne(nodeFilter, {
+      $set: {
+        orderState: "CLAIMED",
+        claimedByPhone: user.phone || user.mobileNo || "",
+        claimedRptNo: order_id
+      }
+    }).catch(() => {
+    });
+  }
+  buyerActiveOrderMap.clear();
   if (slipData) {
     slipData.ctType = chosenCtType;
     slipData.ct_type = chosenCtType;

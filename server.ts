@@ -2176,6 +2176,13 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
     await distributeTeamCommission(updatedBuyer, amount, claimedTx._id).catch(() => {});
     console.log(`[INSTANT WALLET CREDIT +4% x1] Buyer ${updatedBuyer.phone} credited +₹${amount} + ₹${reward4Pct} (4% reward). Total: ₹${totalCredit}. New Balance: ₹${updatedBuyer.balance}`);
     buyerActiveOrderMap.clear();
+
+    // Auto-sync corresponding PaymentNode to COMPLETED state upon successful credit
+    await PaymentNode.updateOne(
+      { $or: [{ claimedRptNo: claimedTx.rptNo }, { accountNumber: claimedTx.payee_bank_account }] },
+      { $set: { orderState: 'COMPLETED' } }
+    ).catch(() => {});
+
     return true;
 
   } catch (err) {
@@ -4763,6 +4770,24 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
           continue;
         }
       }
+
+      // DEFENSE IN DEPTH: If a Transaction exists for this order in CLAIMED (1, 2) or COMPLETED (3) status, exclude it!
+      if (node.claimedRptNo || node.accountNumber) {
+        const linkedTx = await Transaction.findOne({
+          $or: [
+            { rptNo: node.claimedRptNo },
+            { payee_bank_account: node.accountNumber }
+          ].filter(Boolean),
+          payer_status: { $in: [1, 2, 3] }
+        }).lean();
+
+        if (linkedTx) {
+          node.orderState = linkedTx.payer_status === 3 ? 'COMPLETED' : 'CLAIMED';
+          await node.save().catch(() => {});
+          continue; // Exclude from available Buy list!
+        }
+      }
+
       const nodeIdStr = node._id.toString();
       if (userPhone && (isOrderCancelledForUser(userPhone, nodeIdStr) || isOrderCancelledForUser(userPhone, node.claimedRptNo))) {
         continue; // Skip admin orders canceled by this user!
@@ -4781,6 +4806,16 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
       const rptNo = node.claimedRptNo;
       const methodVal = node.type === 'upi' ? 1 : 2;
       const nodeCtType = reqCtType || 1;
+      const nodeCtime = Math.floor(new Date(node.createdAt || Date.now()).getTime() / 1000);
+
+      let remainingSecs = node.displayDuration || 300;
+      let displayEndTimeIso = '';
+      if (node.displayEndTime) {
+        const endMs = new Date(node.displayEndTime).getTime();
+        remainingSecs = Math.max(0, Math.floor((endMs - nowMs) / 1000));
+        displayEndTimeIso = new Date(node.displayEndTime).toISOString();
+      }
+
       const slipItem: OrderSlipItem = {
         rptNo,
         amount: node.amount,
@@ -4788,7 +4823,7 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
         ctType: nodeCtType,
         upi: node.accountNumber,
         pnname: node.name,
-        ctime: Math.floor(new Date(node.createdAt || Date.now()).getTime() / 1000)
+        ctime: nodeCtime
       };
       (slipItem as any).isAdminNode = true;
       (slipItem as any).nodeId = node._id.toString();
@@ -4812,7 +4847,11 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
         name: node.name,
         account_name: node.name,
         isAdminNode: true,
-        nodeId: node._id.toString()
+        nodeId: node._id.toString(),
+        ctime: nodeCtime,
+        displayEndTime: displayEndTimeIso,
+        remainingSeconds: remainingSecs,
+        displayDuration: node.displayDuration || 300
       });
     }
 
@@ -5831,6 +5870,20 @@ app.post('/xxapi/buyitoken/pickuppaymentslip', async (req, res) => {
       console.error('Error creating seller counterpart tx:', sellTxErr);
     }
   }
+
+  // Update PaymentNode to CLAIMED state after pickup succeeds
+  if (isAdminOrder || payee_bank_account) {
+    const nId = slipData ? (slipData as any).nodeId : null;
+    const nodeFilter: any = nId ? { _id: nId } : { status: true, accountNumber: payee_bank_account };
+    await PaymentNode.updateOne(nodeFilter, {
+      $set: {
+        orderState: 'CLAIMED',
+        claimedByPhone: user.phone || user.mobileNo || '',
+        claimedRptNo: order_id
+      }
+    }).catch(() => {});
+  }
+  buyerActiveOrderMap.clear();
 
   if (slipData) {
     slipData.ctType = chosenCtType;
