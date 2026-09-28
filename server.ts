@@ -9138,6 +9138,9 @@ app.get('/xxapi/chargeStatus/:rptNo', async (req, res) => {
   const { rptNo } = req.params;
   const tx = await Transaction.findOne({ rptNo });
   if (!tx) return res.json({ code: 404, msg: 'Transaction not found' });
+  if (tx.payer_status === 3 && !(tx as any).isBalanceCredited) {
+    await ensureBuyerBalanceCredited(tx);
+  }
   return res.json({ code: 0, msg: 'success', data: tx.payer_status });
 });
 
@@ -10746,6 +10749,9 @@ app.get('/xxapi/admin/userDetail', requireAdmin, async (req, res) => {
     }));
 
     const enrichedBuyTx = await Promise.all(buyTransactions.map(async (tx) => {
+      if (tx.payer_status === 3 && !(tx as any).isBalanceCredited) {
+        await ensureBuyerBalanceCredited(tx, user);
+      }
       const txObj = tx.toObject ? tx.toObject() : { ...tx };
       if (txObj.payee_bank_account && typeof txObj.payee_bank_account === 'string' && txObj.payee_bank_account.includes('@')) {
         const vName = await getVerifiedUpiName(txObj.payee_bank_account, txObj.payee_recipients_name || user.realName || user.fullName);
