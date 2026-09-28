@@ -1690,6 +1690,9 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
   const txId = tx._id;
   const rptNo = tx.rptNo || tx.id;
   if (!txId && !rptNo) return false;
+  if (tx.isAdminAddition === true || tx.type === "admin" || String(rptNo || "").startsWith("ADM")) {
+    return false;
+  }
   if (tx.type === "sell" || String(rptNo || "").startsWith("SELL_")) {
     return false;
   }
@@ -1703,8 +1706,9 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
   const queryFilter = {
     payer_status: 3,
     isBalanceCredited: { $ne: true },
-    type: { $ne: "sell" },
-    rptNo: { $not: /^SELL_/i }
+    type: { $nin: ["sell", "admin"] },
+    isAdminAddition: { $ne: true },
+    rptNo: { $not: /^(SELL_|ADM)/i }
   };
   if (txId && isValidObjectId(txId)) {
     queryFilter._id = txId;
@@ -4217,17 +4221,9 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
     });
     if (userPhone2 && filteredList.length > 0) {
       const selectedItem = filteredList[0];
-      buyerActiveOrderMap.set(userPhone2, {
-        rptNo: selectedItem.rptNo,
-        createdAt: Date.now(),
-        slipItem: orderSlipMap.get(selectedItem.rptNo),
-        orderObj: selectedItem
-      });
       if (userIdStr && selectedItem.sellerId) {
         buyerLastSellerMap.set(userIdStr, selectedItem.sellerId);
       }
-    } else if (userPhone2) {
-      buyerActiveOrderMap.delete(userPhone2);
     }
     return res.json({
       code: 0,
@@ -9059,6 +9055,8 @@ app.post("/xxapi/admin/updateBalance", requireAdmin, async (req, res) => {
         amount: txAmount,
         type: "admin",
         isAdminAddition: true,
+        isBalanceCredited: true,
+        reward: 0,
         seqNo: seq5,
         payer_status: 3,
         reason_for_rejection: "Admin Balance " + (type === "add" ? "Add" : type === "subtract" ? "Subtract" : "Set"),

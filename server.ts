@@ -2036,6 +2036,11 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
 
   if (!txId && !rptNo) return false;
 
+  // STRICT RULE 0: Direct Admin Balance Additions (ADM...) MUST NEVER be re-credited or give 4% commission!
+  if (tx.isAdminAddition === true || tx.type === 'admin' || String(rptNo || '').startsWith('ADM')) {
+    return false;
+  }
+
   // STRICT RULE 1: Sell counterpart transactions (SELL_...) must NEVER credit buyer balance!
   if (tx.type === 'sell' || String(rptNo || '').startsWith('SELL_')) {
     return false;
@@ -2057,8 +2062,9 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
   const queryFilter: any = {
     payer_status: 3,
     isBalanceCredited: { $ne: true },
-    type: { $ne: 'sell' },
-    rptNo: { $not: /^SELL_/i }
+    type: { $nin: ['sell', 'admin'] },
+    isAdminAddition: { $ne: true },
+    rptNo: { $not: /^(SELL_|ADM)/i }
   };
 
   if (txId && isValidObjectId(txId)) {
@@ -4989,20 +4995,12 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
       item.methodName = nameStr;
     });
 
-    // Record selected order for sticky persistence & seller rotation ONLY if eligible sellers exist
+    // Record seller rotation ONLY if eligible sellers exist
     if (userPhone && filteredList.length > 0) {
       const selectedItem = filteredList[0];
-      buyerActiveOrderMap.set(userPhone, {
-        rptNo: selectedItem.rptNo,
-        createdAt: Date.now(),
-        slipItem: orderSlipMap.get(selectedItem.rptNo),
-        orderObj: selectedItem
-      });
       if (userIdStr && selectedItem.sellerId) {
         buyerLastSellerMap.set(userIdStr, selectedItem.sellerId);
       }
-    } else if (userPhone) {
-      buyerActiveOrderMap.delete(userPhone);
     }
 
     return res.json({
@@ -10628,6 +10626,8 @@ app.post('/xxapi/admin/updateBalance', requireAdmin, async (req, res) => {
         amount: txAmount,
         type: 'admin',
         isAdminAddition: true,
+        isBalanceCredited: true,
+        reward: 0,
         seqNo: seq5,
         payer_status: 3,
         reason_for_rejection: 'Admin Balance ' + (type === 'add' ? 'Add' : type === 'subtract' ? 'Subtract' : 'Set'),
