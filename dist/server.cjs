@@ -1690,25 +1690,30 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
   const txId = tx._id;
   const rptNo = tx.rptNo || tx.id;
   if (!txId && !rptNo) return false;
-  if (tx.isAdminAddition === true || tx.type === "admin" || String(rptNo || "").startsWith("ADM")) {
+  if (tx.isAdminAddition === true || tx.isUsdt === true || ["admin", "sell", "SELL", "reward", "transfer_in", "transfer_out", "refund"].includes(tx.type) || /^(SELL_|ADM|NWB|INV|USDT)/i.test(String(rptNo || ""))) {
     return false;
   }
-  if (tx.type === "sell" || String(rptNo || "").startsWith("SELL_")) {
+  const validBuyTypes = ["recharge", "buy", "buyitoken", "deposit", "rechargeToken", "BUY", "Buy"];
+  if (tx.type && !validBuyTypes.includes(tx.type)) {
     return false;
   }
   if (Number(tx.payer_status) !== 3) {
     return false;
   }
-  const amount = Number(tx.amount || 0);
-  if (amount <= 0 || !isFinite(amount) || isNaN(amount)) return false;
+  const amount = Number(tx.amount);
+  if (!amount || amount <= 0 || !isFinite(amount) || isNaN(amount)) {
+    console.error(`[ensureBuyerBalanceCredited ERROR] Missing or invalid amount for transaction ${rptNo}:`, tx.amount);
+    return false;
+  }
   const reward4Pct = Math.round(amount * 0.04 * 100) / 100;
   const totalCredit = Math.round((amount + reward4Pct) * 100) / 100;
   const queryFilter = {
     payer_status: 3,
     isBalanceCredited: { $ne: true },
-    type: { $nin: ["sell", "admin"] },
+    type: { $in: validBuyTypes },
     isAdminAddition: { $ne: true },
-    rptNo: { $not: /^(SELL_|ADM)/i }
+    isUsdt: { $ne: true },
+    rptNo: { $not: /^(SELL_|ADM|NWB|INV|USDT)/i }
   };
   if (txId && isValidObjectId(txId)) {
     queryFilter._id = txId;
@@ -3475,25 +3480,84 @@ app.post("/xxapi/oldRptNew/reward", async (req, res) => {
     return res.json({ code: 1, msg: "No new completed newbie friends to claim." });
   }
   const rewardAmt = unclaimedCount * 200;
-  user.balance = (user.balance || 0) + rewardAmt;
-  user.claimedInviteNewbieCount = claimedCount + unclaimedCount;
-  await user.save();
+  const currentClaimed = Number(user.claimedInviteNewbieCount || 0);
+  const updatedUser = await User.findOneAndUpdate(
+    {
+      _id: user._id,
+      $or: [
+        { claimedInviteNewbieCount: currentClaimed },
+        { claimedInviteNewbieCount: { $exists: false } }
+      ]
+    },
+    {
+      $set: { claimedInviteNewbieCount: claimedCount + unclaimedCount },
+      $inc: { balance: rewardAmt }
+    },
+    { new: true }
+  ).catch(() => null);
+  if (!updatedUser) {
+    return res.json({ code: 1, msg: "Already claimed or processing." });
+  }
   const rptNo = "INV" + Date.now() + Math.floor(Math.random() * 1e3);
   const newTx = new Transaction({
-    userId: user._id,
-    phone: user.phone || user.mobileNo,
+    userId: updatedUser._id,
+    phone: updatedUser.phone || updatedUser.mobileNo,
     rptNo,
     amount: rewardAmt,
+    reward: 0,
+    isBalanceCredited: true,
     type: "transfer_in",
     payer_status: 3,
     reason_for_rejection: `Invite Newbie Reward (${unclaimedCount} friends)`,
     ctime: Math.floor(Date.now() / 1e3),
     currentStep: 2
   });
-  await newTx.save();
-  console.log(`[Invite Reward] User ${user.phone} claimed \u20B9${rewardAmt} for ${unclaimedCount} friends.`);
+  await newTx.save().catch(() => {
+  });
+  console.log(`[Invite Reward] User ${updatedUser.phone} claimed \u20B9${rewardAmt} for ${unclaimedCount} friends.`);
   return res.json({ code: 0, msg: "success", data: { rewardAmt } });
 });
+async function claimNewbieRewardAtomically(user) {
+  if (!user || !user._id) return false;
+  const updatedUser = await User.findOneAndUpdate(
+    {
+      _id: user._id,
+      newbieClaimed: { $ne: true },
+      newbieDone: { $nin: ["claimed", 2, true] }
+    },
+    {
+      $set: {
+        newbieClaimed: true,
+        newbieDone: 2
+      },
+      $inc: {
+        balance: 200
+      }
+    },
+    { new: true }
+  ).catch(() => null);
+  if (updatedUser) {
+    const rptNo = "NWB" + Date.now() + Math.floor(Math.random() * 1e3);
+    const newTx = new Transaction({
+      userId: updatedUser._id,
+      phone: updatedUser.phone || updatedUser.mobileNo,
+      rptNo,
+      amount: 200,
+      reward: 0,
+      isBalanceCredited: true,
+      type: "reward",
+      payer_status: 3,
+      reason_for_rejection: "Newbie Reward (\u20B9200)",
+      ctime: Math.floor(Date.now() / 1e3),
+      currentStep: 2
+    });
+    await newTx.save().catch(() => {
+    });
+    console.log(`[Newbie Reward] User ${updatedUser.phone} atomically claimed \u20B9200 newbie reward.`);
+    return true;
+  }
+  return false;
+}
 app.all([
   "/xxapi/newbieDayStep/reward",
   "/xxapi/newbieStepTotal/reward",
@@ -3504,27 +3568,7 @@ app.all([
 ], async (req, res) => {
   const user = await getUserByToken(req);
   if (!user) return res.json({ code: 403, msg: "Unauthorized" });
-  if (!user.newbieClaimed && user.newbieDone !== "claimed" && user.newbieDone !== 2) {
-    user.newbieClaimed = true;
-    user.newbieDone = 2;
-    user.balance = (user.balance || 0) + 200;
-    await user.save();
-    const rptNo = "NWB" + Date.now() + Math.floor(Math.random() * 1e3);
-    const newTx = new Transaction({
-      userId: user._id,
-      phone: user.phone || user.mobileNo,
-      rptNo,
-      amount: 200,
-      type: "reward",
-      payer_status: 3,
-      reason_for_rejection: "Newbie Reward (\u20B9200)",
-      ctime: Math.floor(Date.now() / 1e3),
-      currentStep: 2
-    });
-    await newTx.save().catch(() => {
-    });
-    console.log(`[Newbie Reward] User ${user.phone} successfully claimed \u20B9200 newbie reward.`);
-  }
+  await claimNewbieRewardAtomically(user);
   return res.json({ code: 0, msg: "success", data: { reward: 200, rewardAmt: 200, settleAmt: 200 } });
 });
 app.get("/xxapi/inviteDayStep/init", async (req, res) => {
@@ -3586,12 +3630,7 @@ app.get("/xxapi/buyInrAmount/init", async (req, res) => {
 app.post("/xxapi/buyInrAmount/reward", async (req, res) => {
   const user = await getUserByToken(req);
   if (!user) return res.json({ code: 403, msg: "Unauthorized" });
-  if (!user.newbieDone) {
-    user.newbieDone = true;
-    user.balance = (user.balance || 0) + 200;
-    await user.save();
-    console.log(`[BuyInrAmount Reward] User ${user.phone} received \u20B9200 newbie reward.`);
-  }
+  await claimNewbieRewardAtomically(user);
   return res.json({ code: 0, msg: "success", data: { reward: 200 } });
 });
 app.get("/xxapi/sellInrAmount/init", async (req, res) => {
@@ -7011,11 +7050,14 @@ async function runAutonomousBackgroundWorker() {
         console.error(`[BACKGROUND WORKER] Error processing order ${pTx.rptNo}:`, err);
       }
     }
+    const validWorkerBuyTypes = ["recharge", "buy", "buyitoken", "deposit", "rechargeToken", "BUY", "Buy"];
     const uncreditedSuccessfulTxs = await Transaction.find({
       payer_status: 3,
       isBalanceCredited: { $ne: true },
-      type: { $ne: "sell" },
-      rptNo: { $not: /^SELL_/i }
+      type: { $in: validWorkerBuyTypes },
+      isAdminAddition: { $ne: true },
+      isUsdt: { $ne: true },
+      rptNo: { $not: /^(SELL_|ADM|NWB|INV|USDT)/i }
     }).limit(20);
     for (const uTx of uncreditedSuccessfulTxs) {
       try {
@@ -9960,10 +10002,15 @@ app.post("/xxapi/admin/approveUsdtDeposit", requireAdmin, async (req, res) => {
       tx.amount = Math.round(uAmt * rate);
     }
     tx.payer_status = 3;
-    const reward4Pct = Math.round((tx.amount || 0) * 0.04 * 100) / 100;
-    tx.reward = reward4Pct;
+    tx.isBalanceCredited = true;
+    tx.isUsdt = true;
+    tx.reward = 0;
     await tx.save();
-    await ensureBuyerBalanceCredited(tx);
+    if (tx.userId && tx.amount > 0) {
+      await User.findByIdAndUpdate(tx.userId, {
+        $inc: { balance: tx.amount, recharge: tx.amount }
+      });
+    }
     return res.json({ code: 0, msg: "USDT deposit approved successfully", data: tx });
   } catch (err) {
     console.error("approveUsdtDeposit error:", err);
@@ -10013,7 +10060,6 @@ app.post("/xxapi/admin/createUsdtDeposit", requireAdmin, async (req, res) => {
     const numInr = Number(inrAmount || Math.round(numUsdt * rate));
     const rptNo = "USDT" + Date.now() + Math.floor(Math.random() * 1e3);
     const txStatus = Number(status) || 3;
-    const reward4Pct = Math.round(numInr * 0.04 * 100) / 100;
     const newTx = new Transaction({
       userId: user._id,
       phone: user.phone || trimmedPhone,
@@ -10022,8 +10068,9 @@ app.post("/xxapi/admin/createUsdtDeposit", requireAdmin, async (req, res) => {
       usdtAmount: numUsdt,
       usdtNetwork: network,
       exchangeRate: rate,
-      reward: reward4Pct,
+      reward: 0,
       isUsdt: true,
+      isBalanceCredited: txStatus === 3,
       currency: 1,
       type: "recharge",
       payer_status: txStatus,
@@ -10031,8 +10078,10 @@ app.post("/xxapi/admin/createUsdtDeposit", requireAdmin, async (req, res) => {
       ctime: Math.floor(Date.now() / 1e3)
     });
     await newTx.save();
-    if (txStatus === 3) {
-      await ensureBuyerBalanceCredited(newTx, user);
+    if (txStatus === 3 && numInr > 0) {
+      await User.findByIdAndUpdate(user._id, {
+        $inc: { balance: numInr, recharge: numInr }
+      });
     }
     return res.json({ code: 0, msg: "USDT deposit record created successfully", data: newTx });
   } catch (err) {
