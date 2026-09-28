@@ -1700,7 +1700,7 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
     return false;
   }
   const amount = Number(tx.amount || 0);
-  if (amount <= 0) return false;
+  if (amount <= 0 || !isFinite(amount) || isNaN(amount)) return false;
   const reward4Pct = Math.round(amount * 0.04 * 100) / 100;
   const totalCredit = Math.round((amount + reward4Pct) * 100) / 100;
   const queryFilter = {
@@ -1717,38 +1717,57 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
   } else {
     return false;
   }
-  const claimedTx = await Transaction.findOneAndUpdate(
-    queryFilter,
-    {
-      $set: {
-        isBalanceCredited: true,
-        payer_status: 3,
-        reward: reward4Pct
+  let session = null;
+  let useSession = false;
+  try {
+    session = await import_mongoose.default.startSession();
+    session.startTransaction();
+    useSession = true;
+  } catch (sessErr) {
+    session = null;
+    useSession = false;
+  }
+  try {
+    const sessionOpt = useSession && session ? { session } : {};
+    const claimedTx = await Transaction.findOneAndUpdate(
+      queryFilter,
+      {
+        $set: {
+          isBalanceCredited: true,
+          payer_status: 3,
+          reward: reward4Pct
+        }
+      },
+      { new: true, ...sessionOpt }
+    );
+    if (!claimedTx) {
+      if (useSession && session) {
+        await session.abortTransaction().catch(() => {
+        });
       }
-    },
-    { new: true }
-  ).catch(() => null);
-  if (!claimedTx) {
-    return false;
-  }
-  tx.isBalanceCredited = true;
-  tx.reward = reward4Pct;
-  tx.payer_status = 3;
-  let buyerId = claimedTx.buyerUserId || claimedTx.userId || tx.buyerUserId || tx.userId;
-  let buyer = fallbackUser;
-  if (!buyer && buyerId && isValidObjectId(buyerId)) {
-    buyer = await User.findById(buyerId).catch(() => null);
-  }
-  const buyerPhones = [claimedTx.buyerPhone, claimedTx.phone, tx.buyerPhone, tx.phone].filter(Boolean);
-  if (!buyer && buyerPhones.length > 0) {
-    buyer = await User.findOne({
-      $or: [
-        { phone: { $in: buyerPhones } },
-        { mobileNo: { $in: buyerPhones } }
-      ]
-    }).catch(() => null);
-  }
-  if (buyer) {
+      return false;
+    }
+    let buyerId = claimedTx.buyerUserId || claimedTx.userId || tx.buyerUserId || tx.userId;
+    let buyer = fallbackUser;
+    if (!buyer && buyerId && isValidObjectId(buyerId)) {
+      buyer = await User.findById(buyerId, null, sessionOpt).catch(() => null);
+    }
+    const buyerPhones = [claimedTx.buyerPhone, claimedTx.phone, tx.buyerPhone, tx.phone].filter(Boolean);
+    if (!buyer && buyerPhones.length > 0) {
+      buyer = await User.findOne({
+        $or: [
+          { phone: { $in: buyerPhones } },
+          { mobileNo: { $in: buyerPhones } }
+        ]
+      }, null, sessionOpt).catch(() => null);
+    }
+    if (!buyer) {
+      if (useSession && session) {
+        await session.abortTransaction().catch(() => {
+        });
+      }
+      return false;
+    }
     const updatedBuyer = await User.findByIdAndUpdate(
       buyer._id,
       {
@@ -1759,23 +1778,45 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
           todayProfit: reward4Pct
         }
       },
-      { new: true }
+      { new: true, ...sessionOpt }
     );
-    if (updatedBuyer) {
-      if (fallbackUser && fallbackUser._id && fallbackUser._id.toString() === updatedBuyer._id.toString()) {
-        fallbackUser.balance = updatedBuyer.balance;
-        fallbackUser.recharge = updatedBuyer.recharge;
-        fallbackUser.commission = updatedBuyer.commission;
-        fallbackUser.todayProfit = updatedBuyer.todayProfit;
+    if (!updatedBuyer) {
+      if (useSession && session) {
+        await session.abortTransaction().catch(() => {
+        });
       }
-      await distributeTeamCommission(updatedBuyer, amount, claimedTx._id).catch(() => {
+      return false;
+    }
+    if (useSession && session) {
+      await session.commitTransaction();
+    }
+    tx.isBalanceCredited = true;
+    tx.reward = reward4Pct;
+    tx.payer_status = 3;
+    if (fallbackUser && fallbackUser._id && fallbackUser._id.toString() === updatedBuyer._id.toString()) {
+      fallbackUser.balance = updatedBuyer.balance;
+      fallbackUser.recharge = updatedBuyer.recharge;
+      fallbackUser.commission = updatedBuyer.commission;
+      fallbackUser.todayProfit = updatedBuyer.todayProfit;
+    }
+    await distributeTeamCommission(updatedBuyer, amount, claimedTx._id).catch(() => {
+    });
+    console.log(`[INSTANT WALLET CREDIT +4% x1] Buyer ${updatedBuyer.phone} credited +\u20B9${amount} + \u20B9${reward4Pct} (4% reward). Total: \u20B9${totalCredit}. New Balance: \u20B9${updatedBuyer.balance}`);
+    buyerActiveOrderMap.clear();
+    return true;
+  } catch (err) {
+    if (useSession && session) {
+      await session.abortTransaction().catch(() => {
       });
-      console.log(`[INSTANT WALLET CREDIT +4% x1] Buyer ${updatedBuyer.phone} credited +\u20B9${amount} + \u20B9${reward4Pct} (4% reward). Total: \u20B9${totalCredit}. New Balance: \u20B9${updatedBuyer.balance}`);
-      buyerActiveOrderMap.clear();
-      return true;
+    }
+    console.error(`[ensureBuyerBalanceCredited ERROR] Transaction aborted for ${rptNo}:`, err);
+    return false;
+  } finally {
+    if (useSession && session) {
+      session.endSession().catch(() => {
+      });
     }
   }
-  return true;
 }
 async function getDistinctPayeeUpi(tx, buyerSelectedUpi, user) {
   const knownBuyerUpis = /* @__PURE__ */ new Set();

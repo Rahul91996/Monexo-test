@@ -2053,11 +2053,11 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
   }
 
   const amount = Number(tx.amount || 0);
-  if (amount <= 0) return false;
+  if (amount <= 0 || !isFinite(amount) || isNaN(amount)) return false;
   const reward4Pct = Math.round((amount * 0.04) * 100) / 100;
   const totalCredit = Math.round((amount + reward4Pct) * 100) / 100;
 
-  // ATOMIC LOCK STEP: Mark isBalanceCredited = true FIRST in MongoDB!
+  // ATOMIC LOCK STEP: Mark isBalanceCredited = true FIRST in MongoDB inside transaction session!
   // MUST strictly match payer_status: 3 in DB so that pending/in-review orders NEVER match!
   const queryFilter: any = {
     payer_status: 3,
@@ -2075,48 +2075,67 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
     return false;
   }
 
-  const claimedTx = await Transaction.findOneAndUpdate(
-    queryFilter,
-    {
-      $set: {
-        isBalanceCredited: true,
-        payer_status: 3,
-        reward: reward4Pct
+  let session: any = null;
+  let useSession = false;
+
+  try {
+    session = await mongoose.startSession();
+    session.startTransaction();
+    useSession = true;
+  } catch (sessErr) {
+    session = null;
+    useSession = false;
+  }
+
+  try {
+    const sessionOpt = useSession && session ? { session } : {};
+
+    // 1. ATOMIC CLAIM: Mark isBalanceCredited = true inside the transaction session
+    const claimedTx = await Transaction.findOneAndUpdate(
+      queryFilter,
+      {
+        $set: {
+          isBalanceCredited: true,
+          payer_status: 3,
+          reward: reward4Pct
+        }
+      },
+      { new: true, ...sessionOpt }
+    );
+
+    if (!claimedTx) {
+      if (useSession && session) {
+        await session.abortTransaction().catch(() => {});
       }
-    },
-    { new: true }
-  ).catch(() => null);
+      return false;
+    }
 
-  if (!claimedTx) {
-    // Already credited by another process, or order is not in status 3 in DB! Abort immediately!
-    return false;
-  }
+    // 2. Find buyer safely
+    let buyerId = claimedTx.buyerUserId || claimedTx.userId || tx.buyerUserId || tx.userId;
+    let buyer = fallbackUser;
 
-  // Sync in-memory tx object properties
-  tx.isBalanceCredited = true;
-  tx.reward = reward4Pct;
-  tx.payer_status = 3;
+    if (!buyer && buyerId && isValidObjectId(buyerId)) {
+      buyer = await User.findById(buyerId, null, sessionOpt).catch(() => null);
+    }
 
-  // Find buyer safely
-  let buyerId = claimedTx.buyerUserId || claimedTx.userId || tx.buyerUserId || tx.userId;
-  let buyer = fallbackUser;
+    const buyerPhones = [claimedTx.buyerPhone, claimedTx.phone, tx.buyerPhone, tx.phone].filter(Boolean);
+    if (!buyer && buyerPhones.length > 0) {
+      buyer = await User.findOne({
+        $or: [
+          { phone: { $in: buyerPhones } },
+          { mobileNo: { $in: buyerPhones } }
+        ]
+      }, null, sessionOpt).catch(() => null);
+    }
 
-  if (!buyer && buyerId && isValidObjectId(buyerId)) {
-    buyer = await User.findById(buyerId).catch(() => null);
-  }
+    if (!buyer) {
+      if (useSession && session) {
+        await session.abortTransaction().catch(() => {});
+      }
+      return false;
+    }
 
-  const buyerPhones = [claimedTx.buyerPhone, claimedTx.phone, tx.buyerPhone, tx.phone].filter(Boolean);
-  if (!buyer && buyerPhones.length > 0) {
-    buyer = await User.findOne({
-      $or: [
-        { phone: { $in: buyerPhones } },
-        { mobileNo: { $in: buyerPhones } }
-      ]
-    }).catch(() => null);
-  }
-
-  if (buyer) {
-    // ATOMIC BALANCE INCREMENT IN MONGO DB USING $inc (amount + 4% reward)
+    // 3. ATOMIC BALANCE INCREMENT IN MONGO DB USING $inc (amount + 4% reward)
     const updatedBuyer = await User.findByIdAndUpdate(
       buyer._id,
       {
@@ -2127,24 +2146,49 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
           todayProfit: reward4Pct
         }
       },
-      { new: true }
+      { new: true, ...sessionOpt }
     );
 
-    if (updatedBuyer) {
-      if (fallbackUser && fallbackUser._id && fallbackUser._id.toString() === updatedBuyer._id.toString()) {
-        fallbackUser.balance = updatedBuyer.balance;
-        fallbackUser.recharge = updatedBuyer.recharge;
-        fallbackUser.commission = updatedBuyer.commission;
-        fallbackUser.todayProfit = updatedBuyer.todayProfit;
+    if (!updatedBuyer) {
+      if (useSession && session) {
+        await session.abortTransaction().catch(() => {});
       }
-      await distributeTeamCommission(updatedBuyer, amount, claimedTx._id).catch(() => {});
-      console.log(`[INSTANT WALLET CREDIT +4% x1] Buyer ${updatedBuyer.phone} credited +₹${amount} + ₹${reward4Pct} (4% reward). Total: ₹${totalCredit}. New Balance: ₹${updatedBuyer.balance}`);
-      buyerActiveOrderMap.clear();
-      return true;
+      return false;
+    }
+
+    // 4. COMMIT MONGO DB TRANSACTION
+    if (useSession && session) {
+      await session.commitTransaction();
+    }
+
+    // In-memory sync after successful commit
+    tx.isBalanceCredited = true;
+    tx.reward = reward4Pct;
+    tx.payer_status = 3;
+
+    if (fallbackUser && fallbackUser._id && fallbackUser._id.toString() === updatedBuyer._id.toString()) {
+      fallbackUser.balance = updatedBuyer.balance;
+      fallbackUser.recharge = updatedBuyer.recharge;
+      fallbackUser.commission = updatedBuyer.commission;
+      fallbackUser.todayProfit = updatedBuyer.todayProfit;
+    }
+
+    await distributeTeamCommission(updatedBuyer, amount, claimedTx._id).catch(() => {});
+    console.log(`[INSTANT WALLET CREDIT +4% x1] Buyer ${updatedBuyer.phone} credited +₹${amount} + ₹${reward4Pct} (4% reward). Total: ₹${totalCredit}. New Balance: ₹${updatedBuyer.balance}`);
+    buyerActiveOrderMap.clear();
+    return true;
+
+  } catch (err) {
+    if (useSession && session) {
+      await session.abortTransaction().catch(() => {});
+    }
+    console.error(`[ensureBuyerBalanceCredited ERROR] Transaction aborted for ${rptNo}:`, err);
+    return false;
+  } finally {
+    if (useSession && session) {
+      session.endSession().catch(() => {});
     }
   }
-
-  return true;
 }
 
 async function getDistinctPayeeUpi(tx: any, buyerSelectedUpi: string, user: any): Promise<string> {
