@@ -8869,85 +8869,98 @@ app.all(["/admin", "/admin/*", "/admin.html", "/adminpanel", "/adm", "/adm*"], (
 app.get("/xxapi/admin/stats", requireAdmin, async (req, res) => {
   try {
     await connectToDatabase();
-    const allUsers = await User.find({}).lean();
-    const totalUsers = allUsers.length;
-    let totalBalance = 0;
-    let totalRecharge = 0;
-    let kycVerified = 0;
-    for (const u of allUsers) {
-      totalBalance += Number(u.balance || 0);
-      totalRecharge += Number(u.recharge || 0);
-      if (u.kycStatus === 1 || u.kycStatus === "1" || u.kycStatus === "Verified" || u.kycStatus === "Approved / Verified") {
-        kycVerified++;
-      }
-    }
     const todayStart = /* @__PURE__ */ new Date();
     todayStart.setHours(0, 0, 0, 0);
     const todayStartSec = Math.floor(todayStart.getTime() / 1e3);
-    const todayRegistrations = allUsers.filter((u) => u.createdAt && new Date(u.createdAt) >= todayStart).length;
-    const successfulTxs = await Transaction.find({
-      $or: [{ payer_status: 3 }, { payer_status: "3" }]
-    }).lean();
-    let totalBuyAmount = 0;
-    let totalBuyCount = 0;
-    let todayBuyAmount = 0;
-    let todayBuyCount = 0;
-    let totalSellAmount = 0;
-    let totalSellCount = 0;
-    let todaySellAmount = 0;
-    let todaySellCount = 0;
-    for (const tx of successfulTxs) {
-      const amt = Number(tx.amount || 0);
-      if (isNaN(amt) || amt <= 0) continue;
-      let txSec = 0;
-      if (typeof tx.ctime === "number" && tx.ctime > 0) {
-        txSec = tx.ctime;
-      } else if (tx.timestamp) {
-        txSec = Math.floor(new Date(tx.timestamp).getTime() / 1e3);
-      } else if (tx.createdAt) {
-        txSec = Math.floor(new Date(tx.createdAt).getTime() / 1e3);
-      }
-      const isToday = txSec >= todayStartSec;
-      const isSell = tx.type === "sell" || tx.orderType === "sell";
-      if (isSell) {
-        totalSellAmount += amt;
-        totalSellCount++;
-        if (isToday) {
-          todaySellAmount += amt;
-          todaySellCount++;
+    const [totalUsers, userBalanceStats, todayRegs, txStats] = await Promise.all([
+      User.countDocuments({}),
+      User.aggregate([
+        {
+          $group: {
+            _id: null,
+            totalBalance: { $sum: "$balance" },
+            totalRecharge: { $sum: "$recharge" },
+            kycVerified: {
+              $sum: {
+                $cond: [
+                  { $in: ["$kycStatus", [1, "1", "Verified", "Approved / Verified"]] },
+                  1,
+                  0
+                ]
+              }
+            }
+          }
         }
-      } else {
-        totalBuyAmount += amt;
-        totalBuyCount++;
-        if (isToday) {
-          todayBuyAmount += amt;
-          todayBuyCount++;
+      ]),
+      User.countDocuments({ createdAt: { $gte: todayStart } }),
+      Transaction.aggregate([
+        { $match: { payer_status: { $in: [3, "3"] } } },
+        {
+          $group: {
+            _id: null,
+            totalBuyAmount: { $sum: { $cond: [{ $eq: ["$type", "sell"] }, 0, "$amount"] } },
+            totalBuyCount: { $sum: { $cond: [{ $eq: ["$type", "sell"] }, 0, 1] } },
+            todayBuyAmount: {
+              $sum: {
+                $cond: [
+                  { $and: [{ $ne: ["$type", "sell"] }, { $gte: ["$ctime", todayStartSec] }] },
+                  "$amount",
+                  0
+                ]
+              }
+            },
+            todayBuyCount: {
+              $sum: {
+                $cond: [
+                  { $and: [{ $ne: ["$type", "sell"] }, { $gte: ["$ctime", todayStartSec] }] },
+                  1,
+                  0
+                ]
+              }
+            },
+            totalSellAmount: { $sum: { $cond: [{ $eq: ["$type", "sell"] }, "$amount", 0] } },
+            totalSellCount: { $sum: { $cond: [{ $eq: ["$type", "sell"] }, 1, 0] } },
+            todaySellAmount: {
+              $sum: {
+                $cond: [
+                  { $and: [{ $eq: ["$type", "sell"] }, { $gte: ["$ctime", todayStartSec] }] },
+                  "$amount",
+                  0
+                ]
+              }
+            },
+            todaySellCount: {
+              $sum: {
+                $cond: [
+                  { $and: [{ $eq: ["$type", "sell"] }, { $gte: ["$ctime", todayStartSec] }] },
+                  1,
+                  0
+                ]
+              }
+            }
+          }
         }
-      }
-    }
-    totalBuyAmount = Math.round(totalBuyAmount * 100) / 100;
-    todayBuyAmount = Math.round(todayBuyAmount * 100) / 100;
-    totalSellAmount = Math.round(totalSellAmount * 100) / 100;
-    todaySellAmount = Math.round(todaySellAmount * 100) / 100;
-    totalBalance = Math.round(totalBalance * 100) / 100;
-    totalRecharge = Math.round(totalRecharge * 100) / 100;
+      ])
+    ]);
+    const uStats = userBalanceStats[0] || {};
+    const tStats = txStats[0] || {};
     return res.json({
       code: 0,
       msg: "success",
       data: {
         totalUsers,
-        totalBalance,
-        totalRecharge,
-        kycVerified,
-        todayRegistrations,
-        totalBuyAmount,
-        totalBuyCount,
-        todayBuyAmount,
-        todayBuyCount,
-        totalSellAmount,
-        totalSellCount,
-        todaySellAmount,
-        todaySellCount
+        totalBalance: Math.round((uStats.totalBalance || 0) * 100) / 100,
+        totalRecharge: Math.round((uStats.totalRecharge || 0) * 100) / 100,
+        kycVerified: uStats.kycVerified || 0,
+        todayRegistrations: todayRegs,
+        totalBuyAmount: Math.round((tStats.totalBuyAmount || 0) * 100) / 100,
+        totalBuyCount: tStats.totalBuyCount || 0,
+        todayBuyAmount: Math.round((tStats.todayBuyAmount || 0) * 100) / 100,
+        todayBuyCount: tStats.todayBuyCount || 0,
+        totalSellAmount: Math.round((tStats.totalSellAmount || 0) * 100) / 100,
+        totalSellCount: tStats.totalSellCount || 0,
+        todaySellAmount: Math.round((tStats.todaySellAmount || 0) * 100) / 100,
+        todaySellCount: tStats.todaySellCount || 0
       }
     });
   } catch (err) {
@@ -8974,33 +8987,23 @@ app.get("/xxapi/admin/users", requireAdmin, async (req, res) => {
         };
       }
     }
-    const users = await User.find(filter).sort({ createdAt: -1 }).limit(50);
-    const enrichedUsers = await Promise.all(users.map(async (user) => {
-      const latestLog = await GeneralLog.findOne({
-        $or: [
-          { "body.phone": user.phone },
-          { "body.phone": user.mobileNo },
-          { "headers.token": user.token },
-          { "headers.indiatoken": user.token }
-        ]
-      }).sort({ timestamp: -1 });
-      return {
-        _id: user._id,
-        providerId: user.providerId || user.ownInviteCode || "",
-        teamWorkId: user.providerId || user.ownInviteCode || "",
-        ownInviteCode: user.ownInviteCode || user.referralCode || "",
-        phone: user.phone || user.mobileNo || "N/A",
-        balance: user.balance || 0,
-        recharge: user.recharge || 0,
-        vipLevel: user.vipLevel || 1,
-        kycStatus: user.kycStatus || 0,
-        realName: user.realName || user.fullName || "",
-        upiDetails: user.upiDetails || [],
-        net: user.net || "WiFi/Cellular",
-        ip: latestLog ? latestLog.ip : "N/A",
-        deviceType: latestLog && latestLog.headers ? latestLog.headers["user-agent"] : "N/A",
-        createdAt: user.createdAt
-      };
+    const users = await User.find(filter).sort({ createdAt: -1 }).limit(100).lean();
+    const enrichedUsers = users.map((user) => ({
+      _id: user._id,
+      providerId: user.providerId || user.ownInviteCode || "",
+      teamWorkId: user.providerId || user.ownInviteCode || "",
+      ownInviteCode: user.ownInviteCode || user.referralCode || "",
+      phone: user.phone || user.mobileNo || "N/A",
+      balance: user.balance || 0,
+      recharge: user.recharge || 0,
+      vipLevel: user.vipLevel || 1,
+      kycStatus: user.kycStatus || 0,
+      realName: user.realName || user.fullName || "",
+      upiDetails: user.upiDetails || [],
+      net: user.net || "WiFi/Cellular",
+      ip: user.lastIp || user.ip || "N/A",
+      deviceType: user.deviceType || "Mobile/Web",
+      createdAt: user.createdAt
     }));
     return res.json({
       code: 0,
@@ -10472,26 +10475,26 @@ app.get("/xxapi/admin/nodes", requireAdmin, async (req, res) => {
   try {
     const nodes = await PaymentNode.find().sort({ createdAt: -1 }).lean();
     const now = Date.now();
-    const enrichedNodes = await Promise.all(nodes.map(async (n) => {
+    const claimedRpts = nodes.map((n) => n.claimedRptNo).filter(Boolean);
+    const linkedTxs = claimedRpts.length > 0 ? await Transaction.find({ rptNo: { $in: claimedRpts } }).lean() : [];
+    const txMap = /* @__PURE__ */ new Map();
+    for (const t of linkedTxs) {
+      if (t && t.rptNo) txMap.set(t.rptNo, t);
+    }
+    const enrichedNodes = nodes.map((n) => {
       let state = n.orderState || "ACTIVE";
       let remainingSeconds = 0;
       let txUtr = n.utr || "";
       let buyerPhone = n.claimedByPhone || "";
       if (n.claimedRptNo) {
-        const tx = await Transaction.findOne({ rptNo: n.claimedRptNo });
+        const tx = txMap.get(n.claimedRptNo);
         if (tx) {
           if (tx.utr) txUtr = tx.utr;
           if (tx.phone) buyerPhone = tx.phone;
           if (tx.payer_status === 3) {
             state = "COMPLETED";
-            await PaymentNode.updateOne({ _id: n._id }, { orderState: "COMPLETED", utr: txUtr }).catch(() => {
-            });
           } else if (tx.payer_status === 1 || tx.payer_status === 2 || tx.payer_status === 0) {
             state = "CLAIMED";
-            if (n.orderState !== "CLAIMED" || n.status !== false) {
-              await PaymentNode.updateOne({ _id: n._id }, { status: false, orderState: "CLAIMED" }).catch(() => {
-              });
-            }
           } else if (tx.payer_status === 4 || tx.payer_status === 5) {
             state = "CANCELLED";
           }
@@ -10502,15 +10505,9 @@ app.get("/xxapi/admin/nodes", requireAdmin, async (req, res) => {
         remainingSeconds = Math.max(0, Math.floor(diffMs / 1e3));
         if (remainingSeconds <= 0) {
           state = "EXPIRED";
-          await PaymentNode.updateOne({ _id: n._id }, { orderState: "EXPIRED" }).catch(() => {
-          });
         }
       } else {
         remainingSeconds = 0;
-      }
-      let vName = n.name;
-      if (n.accountNumber && typeof n.accountNumber === "string" && n.accountNumber.includes("@")) {
-        vName = await getVerifiedUpiName(n.accountNumber, n.name) || n.name;
       }
       return {
         ...n,
@@ -10518,9 +10515,9 @@ app.get("/xxapi/admin/nodes", requireAdmin, async (req, res) => {
         claimedByPhone: buyerPhone || n.claimedByPhone || "",
         remainingSeconds,
         utr: txUtr,
-        verifiedName: vName
+        verifiedName: n.name
       };
-    }));
+    });
     const activeOnlyNodes = enrichedNodes.filter((n) => n.orderState !== "EXPIRED" && n.orderState !== "COMPLETED" && n.orderState !== "CANCELLED");
     return res.json({ code: 0, msg: "success", data: activeOnlyNodes });
   } catch (err) {
@@ -10535,26 +10532,26 @@ app.get("/xxapi/admin/nodeHistory", requireAdmin, async (req, res) => {
     }
     const nodes = await PaymentNode.find().sort({ createdAt: -1 }).lean();
     const now = Date.now();
-    const enrichedHistory = await Promise.all(nodes.map(async (n) => {
+    const claimedRpts = nodes.map((n) => n.claimedRptNo).filter(Boolean);
+    const linkedTxs = claimedRpts.length > 0 ? await Transaction.find({ rptNo: { $in: claimedRpts } }).lean() : [];
+    const txMap = /* @__PURE__ */ new Map();
+    for (const t of linkedTxs) {
+      if (t && t.rptNo) txMap.set(t.rptNo, t);
+    }
+    const enrichedHistory = nodes.map((n) => {
       let state = n.orderState || "ACTIVE";
       let remainingSeconds = 0;
       let txUtr = n.utr || "";
       let buyerPhone = n.claimedByPhone || "";
       if (n.claimedRptNo) {
-        const tx = await Transaction.findOne({ rptNo: n.claimedRptNo });
+        const tx = txMap.get(n.claimedRptNo);
         if (tx) {
           if (tx.utr) txUtr = tx.utr;
           if (tx.phone) buyerPhone = tx.phone;
           if (tx.payer_status === 3) {
             state = "COMPLETED";
-            await PaymentNode.updateOne({ _id: n._id }, { orderState: "COMPLETED", utr: txUtr }).catch(() => {
-            });
           } else if (tx.payer_status === 1 || tx.payer_status === 2 || tx.payer_status === 0) {
             state = "CLAIMED";
-            if (n.orderState !== "CLAIMED" || n.status !== false) {
-              await PaymentNode.updateOne({ _id: n._id }, { status: false, orderState: "CLAIMED" }).catch(() => {
-              });
-            }
           } else if (tx.payer_status === 4 || tx.payer_status === 5) {
             state = "CANCELLED";
           }
@@ -10565,8 +10562,6 @@ app.get("/xxapi/admin/nodeHistory", requireAdmin, async (req, res) => {
         remainingSeconds = Math.max(0, Math.floor(diffMs / 1e3));
         if (remainingSeconds <= 0) {
           state = "EXPIRED";
-          await PaymentNode.updateOne({ _id: n._id }, { orderState: "EXPIRED" }).catch(() => {
-          });
         }
       } else {
         remainingSeconds = 0;
@@ -10579,7 +10574,7 @@ app.get("/xxapi/admin/nodeHistory", requireAdmin, async (req, res) => {
         utr: txUtr,
         displayEndTimeFormatted: n.displayEndTime ? new Date(n.displayEndTime).toLocaleString() : ""
       };
-    }));
+    });
     return res.json({ code: 0, msg: "success", data: enrichedHistory });
   } catch (err) {
     console.error("Get node history error:", err);
@@ -10720,7 +10715,7 @@ app.get("/xxapi/admin/paymentHistory", requireAdmin, async (req, res) => {
         conditions.push({ userId: objId });
         conditions.push({ sellerId: objId });
       }
-      const matchedUsers = await User.find({
+      const matchedUsers2 = await User.find({
         $or: [
           { phone: new RegExp(q, "i") },
           { mobileNo: new RegExp(q, "i") },
@@ -10728,9 +10723,9 @@ app.get("/xxapi/admin/paymentHistory", requireAdmin, async (req, res) => {
           { providerId: new RegExp(q, "i") }
         ]
       }).select("_id phone").limit(20);
-      if (matchedUsers.length > 0) {
-        const uIds = matchedUsers.map((u) => u._id);
-        const uPhones = matchedUsers.map((u) => u.phone).filter(Boolean);
+      if (matchedUsers2.length > 0) {
+        const uIds = matchedUsers2.map((u) => u._id);
+        const uPhones = matchedUsers2.map((u) => u.phone).filter(Boolean);
         conditions.push({ userId: { $in: uIds } });
         conditions.push({ sellerId: { $in: uIds } });
         conditions.push({ phone: { $in: uPhones } });
@@ -10742,34 +10737,54 @@ app.get("/xxapi/admin/paymentHistory", requireAdmin, async (req, res) => {
         queryFilter.$or = conditions;
       }
     }
-    const txs = await Transaction.find(queryFilter).sort({ ctime: -1, _id: -1 }).limit(100);
-    const enrichedOrders = await Promise.all(txs.map(async (tx) => {
-      const txObj = tx.toObject ? tx.toObject() : { ...tx };
-      let buyer = null;
-      if (tx.userId) {
-        buyer = await User.findById(tx.userId).catch(() => null);
+    const txs = await Transaction.find(queryFilter).sort({ ctime: -1, _id: -1 }).limit(100).lean();
+    const userIdsToFetch = /* @__PURE__ */ new Set();
+    const userPhonesToFetch = /* @__PURE__ */ new Set();
+    const counterpartRptsToFetch = /* @__PURE__ */ new Set();
+    for (const tx of txs) {
+      if (tx.userId) userIdsToFetch.add(tx.userId.toString());
+      if (tx.sellerId) userIdsToFetch.add(tx.sellerId.toString());
+      if (tx.phone) userPhonesToFetch.add(tx.phone);
+      if (tx.sellerPhone) userPhonesToFetch.add(tx.sellerPhone);
+      const cleanRptNo = String(tx.rptNo || "").replace(/^SELL_/i, "").trim();
+      if (cleanRptNo) {
+        const counterpartRpt = String(tx.rptNo || "").startsWith("SELL_") ? cleanRptNo : `SELL_${cleanRptNo}`;
+        counterpartRptsToFetch.add(counterpartRpt);
       }
-      if (!buyer && tx.phone) {
-        buyer = await User.findOne({ $or: [{ phone: tx.phone }, { mobileNo: tx.phone }] }).catch(() => null);
-      }
-      let seller = null;
-      if (tx.sellerId) {
-        seller = await User.findById(tx.sellerId).catch(() => null);
-      }
-      if (!seller && tx.sellerPhone) {
-        seller = await User.findOne({ $or: [{ phone: tx.sellerPhone }, { mobileNo: tx.sellerPhone }] }).catch(() => null);
-      }
+    }
+    const matchedUsers = await User.find({
+      $or: [
+        { _id: { $in: Array.from(userIdsToFetch).filter((id) => isValidObjectId(id)) } },
+        { phone: { $in: Array.from(userPhonesToFetch) } },
+        { mobileNo: { $in: Array.from(userPhonesToFetch) } }
+      ].filter(Boolean)
+    }).lean();
+    const userByIdMap = /* @__PURE__ */ new Map();
+    const userByPhoneMap = /* @__PURE__ */ new Map();
+    for (const u of matchedUsers) {
+      if (u._id) userByIdMap.set(u._id.toString(), u);
+      if (u.phone) userByPhoneMap.set(u.phone, u);
+      if (u.mobileNo) userByPhoneMap.set(u.mobileNo, u);
+    }
+    const counterpartTxs = await Transaction.find({
+      rptNo: { $in: Array.from(counterpartRptsToFetch) }
+    }).lean();
+    const counterpartTxMap = /* @__PURE__ */ new Map();
+    for (const cTx of counterpartTxs) {
+      if (cTx && cTx.rptNo) counterpartTxMap.set(cTx.rptNo, cTx);
+    }
+    const enrichedOrders = txs.map((tx) => {
+      const txObj = { ...tx };
+      const buyer = tx.userId && userByIdMap.get(tx.userId.toString()) || tx.phone && userByPhoneMap.get(tx.phone) || null;
+      const seller = tx.sellerId && userByIdMap.get(tx.sellerId.toString()) || tx.sellerPhone && userByPhoneMap.get(tx.sellerPhone) || null;
       const buyerPhone = buyer ? buyer.phone || buyer.mobileNo : tx.phone || "N/A";
       const buyerUid = buyer ? String(buyer._id) : "N/A";
       const buyerRealName = buyer ? buyer.realName || buyer.fullName || "N/A" : "N/A";
       const sellerPhone = seller ? seller.phone || seller.mobileNo : tx.sellerPhone || "N/A";
       const sellerUid = seller ? String(seller._id) : "N/A";
       const payeeName = tx.payee_recipients_name || (seller ? seller.realName || seller.fullName : "Monexo Merchant");
-      let verifiedName = payeeName;
+      const verifiedName = tx.verified_name || payeeName;
       const payeeAccount = tx.payee_bank_account || "";
-      if (payeeAccount && payeeAccount.includes("@")) {
-        verifiedName = await getVerifiedUpiName(payeeAccount, payeeName);
-      }
       let paymentMethodStr = "UPI Payment";
       if (tx.payment_method === 0 || tx.payment_method === 2) {
         paymentMethodStr = "Bank Transfer";
@@ -10779,10 +10794,9 @@ app.get("/xxapi/admin/paymentHistory", requireAdmin, async (req, res) => {
       const nameMatch = Boolean(verifiedName && verifiedName.trim().length > 1);
       const upiMatch = Boolean(payeeAccount && (payeeAccount.includes("@") || payeeAccount.length >= 8));
       const amountMatch = Boolean(tx.amount && tx.amount > 0);
-      const paymentSuccessStatus = tx.payer_status === 3;
       const cleanRptNo = String(txObj.rptNo || "").replace(/^SELL_/i, "").trim();
       const counterpartRpt = String(txObj.rptNo || "").startsWith("SELL_") ? cleanRptNo : `SELL_${cleanRptNo}`;
-      const counterpartTx = cleanRptNo ? await Transaction.findOne({ rptNo: counterpartRpt }).lean() : null;
+      const counterpartTx = counterpartTxMap.get(counterpartRpt) || null;
       const isCancelled = txObj.payer_status === 4 || txObj.payer_status === 5 || counterpartTx?.payer_status === 4 || counterpartTx?.payer_status === 5 || isOrderCancelledForUser("", cleanRptNo) || cleanRptNo && orderSlipMap.get(cleanRptNo)?.payer_status === 4;
       const isSuccess = txObj.payer_status === 3 || counterpartTx?.payer_status === 3;
       let effectivePayerStatus = txObj.payer_status;
@@ -10803,11 +10817,9 @@ app.get("/xxapi/admin/paymentHistory", requireAdmin, async (req, res) => {
         ctime: txObj.ctime || Math.floor(Date.now() / 1e3),
         payer_status: txObj.payer_status || 1,
         orderStatusLabel,
-        // Buyer Info
         buyerPhone,
         buyerUid,
         buyerRealName,
-        // Seller / Payee Info
         sellerPhone,
         sellerUid,
         payeeName,
@@ -10816,16 +10828,14 @@ app.get("/xxapi/admin/paymentHistory", requireAdmin, async (req, res) => {
         payeeIfsc: txObj.payee_ifsc || "",
         payeeBankName: txObj.payee_bankname || "",
         paymentMethod: paymentMethodStr,
-        // 4 Match Indicators
         nameMatch,
         upiMatch,
         amountMatch,
-        paymentSuccessStatus,
-        // Internal Admin Reason / Note (Only returned to Admin Panel!)
+        paymentSuccessStatus: effectivePayerStatus === 3,
         adminReason: txObj.adminReason || txObj.internalAdminNote || "",
         adminActionAt: txObj.adminActionAt || null
       };
-    }));
+    });
     return res.json({
       code: 0,
       msg: "success",
