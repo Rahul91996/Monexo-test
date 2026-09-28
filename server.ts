@@ -3055,8 +3055,11 @@ app.post('/xxapi/logout', async (req, res) => {
 async function getUserSellerTransactions(user: any): Promise<any[]> {
   if (!user) return [];
   const userIds = [user._id, user.id, (user as any).userId, (user as any).providerId].filter(Boolean);
-  const phones = [user.phone, (user as any).mobileNo].filter(Boolean);
-  const allUserIds = Array.from(new Set([...userIds, ...userIds.map(String)]));
+  const phones = [user.phone, (user as any).mobileNo, user.username].filter(Boolean);
+  const objectIds = userIds.map(id => {
+    try { return isValidObjectId(id) ? new mongoose.Types.ObjectId(id) : null; } catch(e) { return null; }
+  }).filter(Boolean);
+  const allUserIds = Array.from(new Set([...userIds, ...userIds.map(String), ...objectIds]));
 
   const upiAccounts: string[] = [];
   if (user.collectionTools && Array.isArray(user.collectionTools)) {
@@ -3083,12 +3086,11 @@ async function getUserSellerTransactions(user: any): Promise<any[]> {
 
   const sellerOrConditions: any[] = [
     { sellerId: { $in: allUserIds } },
-    { 'sellerId': { $in: userIds.map(String) } },
     { sellerPhone: { $in: phones } },
     { seller_phone: { $in: phones } },
-    { userId: { $in: allUserIds }, type: { $in: ['sell', 'SELL', 'withdraw'] } },
-    { phone: { $in: phones }, type: { $in: ['sell', 'SELL', 'withdraw'] } },
-    { rptNo: /^SELL_/i, $or: [{ userId: { $in: allUserIds } }, { phone: { $in: phones } }] }
+    { userId: { $in: allUserIds }, type: { $in: ['sell', 'SELL', 'withdraw', 'sellitoken', 'sell_itoken', 'sell_inr'] } },
+    { phone: { $in: phones }, type: { $in: ['sell', 'SELL', 'withdraw', 'sellitoken', 'sell_itoken', 'sell_inr'] } },
+    { rptNo: /^SELL_/i, $or: [{ userId: { $in: allUserIds } }, { phone: { $in: phones } }, { sellerId: { $in: allUserIds } }] }
   ];
 
   if (cleanUpis.length > 0) {
@@ -8104,6 +8106,7 @@ async function autoCheckAndApproveOrderFromAutomation(tx: any): Promise<boolean>
           await PaymentNode.updateOne({ claimedRptNo: tx.rptNo }, { orderState: 'COMPLETED', utr: matchResult.utr }).catch(() => {});
         }
 
+        buyerActiveOrderMap.clear();
         return true;
       }
     }
@@ -8112,6 +8115,78 @@ async function autoCheckAndApproveOrderFromAutomation(tx: any): Promise<boolean>
   }
   return false;
 }
+
+/**
+ * AUTONOMOUS SERVER-SIDE BACKGROUND WORKER LOOP (Runs every 3 seconds)
+ * - Independent of client page navigation or whether user/admin app is open.
+ * - Processes all pending in-review orders (payer_status === 2) and auto-matches UTR from automation server.
+ * - Credits buyer balance (+4% reward) & debits seller balance immediately upon order completion.
+ * - Auto-credits any uncredited successful orders in DB.
+ * - Expires outdated payment nodes automatically.
+ */
+let isBackgroundWorkerRunning = false;
+
+async function runAutonomousBackgroundWorker() {
+  if (isBackgroundWorkerRunning) return;
+  isBackgroundWorkerRunning = true;
+
+  try {
+    // 1. Process all pending in-review orders (payer_status === 2)
+    const pendingReviewTxs = await Transaction.find({
+      payer_status: 2,
+      type: { $ne: 'sell' },
+      rptNo: { $not: /^SELL_/i }
+    }).sort({ ctime: -1 }).limit(20);
+
+    for (const pTx of pendingReviewTxs) {
+      try {
+        const approved = await autoCheckAndApproveOrderFromAutomation(pTx);
+        if (approved) {
+          buyerActiveOrderMap.clear();
+          console.log(`[AUTONOMOUS BACKGROUND WORKER] Order ${pTx.rptNo} AUTO-APPROVED & Balance Credited!`);
+        }
+      } catch (err) {
+        console.error(`[BACKGROUND WORKER] Error processing order ${pTx.rptNo}:`, err);
+      }
+    }
+
+    // 2. Ensure any uncredited successful buy transactions (payer_status === 3) get credited
+    const uncreditedSuccessfulTxs = await Transaction.find({
+      payer_status: 3,
+      isBalanceCredited: { $ne: true },
+      type: { $ne: 'sell' },
+      rptNo: { $not: /^SELL_/i }
+    }).limit(20);
+
+    for (const uTx of uncreditedSuccessfulTxs) {
+      try {
+        await ensureBuyerBalanceCredited(uTx);
+      } catch (err) {
+        console.error(`[BACKGROUND WORKER] Error crediting uncredited order ${uTx.rptNo}:`, err);
+      }
+    }
+
+    // 3. Auto-expire outdated payment nodes whose displayEndTime has passed
+    const now = new Date();
+    await PaymentNode.updateMany(
+      {
+        orderState: 'ACTIVE',
+        displayEndTime: { $lte: now }
+      },
+      {
+        $set: { orderState: 'EXPIRED' }
+      }
+    ).catch(() => {});
+
+  } catch (err) {
+    console.error('[AUTONOMOUS BACKGROUND WORKER ERROR]', err);
+  } finally {
+    isBackgroundWorkerRunning = false;
+  }
+}
+
+// Start autonomous background worker every 3 seconds
+setInterval(runAutonomousBackgroundWorker, 3000);
 
 app.post('/xxapi/monitorflow/three', async (req, res) => {
   const user = await getUserByToken(req);
@@ -9332,12 +9407,11 @@ async function getSellHistory(req: any, res: any) {
 
     const sellerOrConditions: any[] = [
       { sellerId: { $in: allUserIds } },
-      { 'sellerId': { $in: userIds.map(String) } },
       { sellerPhone: { $in: phones } },
       { seller_phone: { $in: phones } },
-      { userId: { $in: allUserIds }, type: { $in: ['sell', 'SELL', 'withdraw'] } },
-      { phone: { $in: phones }, type: { $in: ['sell', 'SELL', 'withdraw'] } },
-      { rptNo: /^SELL_/i, $or: [{ userId: { $in: allUserIds } }, { phone: { $in: phones } }] }
+      { userId: { $in: allUserIds }, type: { $in: ['sell', 'SELL', 'withdraw', 'sellitoken', 'sell_itoken', 'sell_inr'] } },
+      { phone: { $in: phones }, type: { $in: ['sell', 'SELL', 'withdraw', 'sellitoken', 'sell_itoken', 'sell_inr'] } },
+      { rptNo: /^SELL_/i, $or: [{ userId: { $in: allUserIds } }, { phone: { $in: phones } }, { sellerId: { $in: allUserIds } }] }
     ];
 
     if (cleanUpis.length > 0) {
@@ -9433,11 +9507,11 @@ async function getSellHistory(req: any, res: any) {
       return true;
     });
 
-    if (['1', '2', 'paying', 'dispatched', 'undispatched', 'pending', 'in_progress', 'active'].includes(statusStr)) {
+    if (['1', '2', 'paying', 'dispatched', 'undispatched', 'pending', 'in_progress', 'active', 'paying_status'].some(s => statusStr.includes(s) || statusStr === s)) {
       deduplicatedTxs = deduplicatedTxs.filter(t => t.payer_status === 1 || t.payer_status === 2);
-    } else if (['3', 'success', 'successfully', 'done', 'completed'].includes(statusStr)) {
+    } else if (['3', 'success', 'successfully', 'done', 'completed'].some(s => statusStr.includes(s) || statusStr === s)) {
       deduplicatedTxs = deduplicatedTxs.filter(t => t.payer_status === 3);
-    } else if (['4', '5', 'cancel', 'cancelled', 'failed', 'offline'].includes(statusStr)) {
+    } else if (['4', '5', 'cancel', 'cancelled', 'failed', 'offline'].some(s => statusStr.includes(s) || statusStr === s)) {
       deduplicatedTxs = deduplicatedTxs.filter(t => t.payer_status === 4 || t.payer_status === 5);
     }
 
