@@ -2639,13 +2639,15 @@ app.get(["/xxapi/userinfo", "/userinfo"], async (req, res) => {
       await user.save();
     }
     try {
+      const userIds = [user._id, user._id ? user._id.toString() : ""].filter(Boolean);
+      const userPhones = [user.phone, user.mobileNo].filter(Boolean);
       const uncreditedBuyTxs = await Transaction.find({
         $or: [
-          { userId: user._id.toString() },
-          { buyerUserId: user._id.toString() },
-          { phone: user.phone },
-          { buyerPhone: user.phone }
-        ].filter(Boolean),
+          { userId: { $in: userIds } },
+          { buyerUserId: { $in: userIds } },
+          { phone: { $in: userPhones } },
+          { buyerPhone: { $in: userPhones } }
+        ],
         type: { $ne: "sell" },
         rptNo: { $not: /^SELL_/i },
         payer_status: 3,
@@ -2655,8 +2657,6 @@ app.get(["/xxapi/userinfo", "/userinfo"], async (req, res) => {
         for (const bTx of uncreditedBuyTxs) {
           await ensureBuyerBalanceCredited(bTx, user);
         }
-        const reloadedUser = await User.findById(user._id);
-        if (reloadedUser) user = reloadedUser;
       }
     } catch (txSyncErr) {
       console.error("[User Info Sync Error]", txSyncErr);
@@ -2697,12 +2697,13 @@ app.get(["/xxapi/userinfo", "/userinfo"], async (req, res) => {
         }
       }
     }
-    const currentTotalBalance = Number(user.balance ?? 0);
+    const freshUser = await User.findById(user._id) || user;
+    const currentTotalBalance = Number(freshUser.balance ?? 0);
     const frozenItoken = inSellAmount;
     const availableIToken = Math.max(0, currentTotalBalance - frozenItoken);
-    const myInviteCode = user.ownInviteCode || user.referralCode || "";
-    const userPhone2 = user.phone || user.mobileNo || user.username || "";
-    const todayDailyData = await calculateUserDailyData(user, getISTTodayStartSec(), getISTTodayStartSec() + 86399);
+    const myInviteCode = freshUser.ownInviteCode || freshUser.referralCode || "";
+    const userPhone2 = freshUser.phone || freshUser.mobileNo || freshUser.username || "";
+    const todayDailyData = await calculateUserDailyData(freshUser, getISTTodayStartSec(), getISTTodayStartSec() + 86399);
     let globalConfig = null;
     try {
       globalConfig = await SiteConfig.findOne({ key: "global" });
@@ -2713,33 +2714,33 @@ app.get(["/xxapi/userinfo", "/userinfo"], async (req, res) => {
       code: 0,
       msg: "success",
       data: {
-        uid: user._id,
-        id: user.providerId,
+        uid: freshUser._id,
+        id: freshUser.providerId,
         username: userPhone2,
         phone: userPhone2,
-        teamWorkId: user.providerId,
+        teamWorkId: freshUser.providerId,
         ownInviteCode: myInviteCode,
         referralCode: myInviteCode,
         referral_code: myInviteCode,
         inviteCode: myInviteCode,
-        invitercode: user.invitercode || "",
+        invitercode: freshUser.invitercode || "",
         balance: currentTotalBalance,
-        commission: user.commission ?? 0,
+        commission: freshUser.commission ?? 0,
         withdrawable: availableIToken,
-        recharge: user.recharge ?? 0,
-        vipLevel: user.vipLevel ?? 1,
-        safetyCodeSet: !!user.safetyCode,
-        bankCount: user.bankDetails ? user.bankDetails.length : 0,
-        upiCount: user.upiDetails ? user.upiDetails.length : 0,
-        kycStatus: user.kycStatus ?? 0,
-        realName: user.realName || user.fullName || "",
-        parentUser: user.parentUser || "",
+        recharge: freshUser.recharge ?? 0,
+        vipLevel: freshUser.vipLevel ?? 1,
+        safetyCodeSet: !!freshUser.safetyCode,
+        bankCount: freshUser.bankDetails ? freshUser.bankDetails.length : 0,
+        upiCount: freshUser.upiDetails ? freshUser.upiDetails.length : 0,
+        kycStatus: freshUser.kycStatus ?? 0,
+        realName: freshUser.realName || freshUser.fullName || "",
+        parentUser: freshUser.parentUser || "",
         todayProfit: todayDailyData.totalProfit,
         sysOpenPay: 1,
-        trc20Address: user.trc20Address || defaultTrc20Addr,
-        net: user.net || "",
-        pageSize: user.pageSize || 10,
-        totalTransferValue: user.totalTransferValue || 0,
+        trc20Address: freshUser.trc20Address || defaultTrc20Addr,
+        net: freshUser.net || "",
+        pageSize: freshUser.pageSize || 10,
+        totalTransferValue: freshUser.totalTransferValue || 0,
         itoken: availableIToken,
         frozenItoken,
         receiveToday: {
@@ -4467,8 +4468,7 @@ app.get("/xxapi/buyitoken/paymentslipdetail", async (req, res) => {
   }
   const currentPayerStatus = tx ? tx.payer_status : slipData && slipData.payer_status ? slipData.payer_status : 1;
   if (currentPayerStatus === 3 && tx && !tx.isBalanceCredited) {
-    ensureBuyerBalanceCredited(tx).catch(() => {
-    });
+    await ensureBuyerBalanceCredited(tx);
   }
   const methodNum = isUpi ? 1 : 2;
   return res.json({
@@ -7515,8 +7515,7 @@ async function getRechargeHistory(req, res) {
     if (buyerSelectedUpi) buyerUpis.push(String(buyerSelectedUpi).toLowerCase().trim());
     const payeeUpi = await getDistinctPayeeUpi(tx, buyerSelectedUpi, user);
     if (tx.payer_status === 3 && !tx.isBalanceCredited) {
-      ensureBuyerBalanceCredited(tx).catch(() => {
-      });
+      await ensureBuyerBalanceCredited(tx);
     }
     const debitTimeSec = tx.ctime || Math.floor(Date.now() / 1e3);
     const dealTimeSec = tx.dealTime || tx.utime || (tx.payer_status >= 2 ? tx.updatedAt ? Math.floor(new Date(tx.updatedAt).getTime() / 1e3) : debitTimeSec : debitTimeSec);
