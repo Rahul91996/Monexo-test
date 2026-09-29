@@ -113,7 +113,6 @@ app.use((req, res, next) => {
 });
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("X-Frame-Options", "SAMEORIGIN");
   res.setHeader("X-XSS-Protection", "1; mode=block");
   res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
@@ -293,7 +292,10 @@ var userSchema = new import_mongoose.default.Schema({
   referral_code: { type: String },
   inviteFriendsClaimedAmt: { type: Number, default: 0 },
   newbieParams: { type: String, default: "" },
-  newbieDone: { type: Number, default: 0 },
+  newbieDone: { type: import_mongoose.default.Schema.Types.Mixed, default: 0 },
+  newbieClaimed: { type: Boolean, default: false },
+  claimedInviteNewbieCount: { type: Number, default: 0 },
+  claimedInviteFriendPhones: { type: Array, default: [] },
   isBlocked: { type: Boolean, default: false },
   role: { type: String, default: "user" },
   createdAt: { type: Date, default: Date.now }
@@ -701,15 +703,25 @@ async function calculateUserDailyData(user, startSec, endSec) {
       { buyerPhone: { $in: userPhones } }
     ],
     payer_status: 3,
-    type: { $ne: "sell" },
+    type: { $in: ["buy", "recharge", "buyitoken", "BUY", "Buy"] },
     isAdminAddition: { $ne: true },
-    rptNo: { $not: /^ADM/i },
-    reason_for_rejection: { $not: /Admin Balance|Newbie Reward|Invite Reward|Bonus/i }
+    isUsdt: { $ne: true },
+    rptNo: { $not: /^(ADM|TXN_ADM|NWB|INV|USDT|MANUAL)/i },
+    reason_for_rejection: { $not: /Admin|Manual|Adjustment|Add|Subtract|Bonus|Reward|Newbie|Invite/i }
   });
   let times = 0;
   let recharge = 0;
   let reward = 0;
   for (const tx of buyTxs) {
+    if (tx.isAdminAddition === true || tx.isManualAdmin === true || tx.type === "admin" || tx.type === "reward" || tx.type === "transfer_in" || tx.type === "transfer_out" || tx.rptNo && /^(ADM|TXN_ADM|NWB|INV|USDT|MANUAL)/i.test(tx.rptNo) || tx.reason_for_rejection && /Admin|Manual|Adjustment|Add|Subtract|Bonus|Reward|Newbie|Invite/i.test(tx.reason_for_rejection) || tx.adminReason) {
+      continue;
+    }
+    const isRealP2pBuy = Boolean(
+      tx.payee_bank_account || tx.sellerId || tx.sellerPhone || tx.ct_account || tx.paymentNodeId || tx.ctType || tx.utr && tx.type === "buy"
+    );
+    if (!isRealP2pBuy) {
+      continue;
+    }
     let txSec = tx.ctime || 0;
     if (txSec > 1e10) txSec = Math.floor(txSec / 1e3);
     if (!txSec && tx.createdAt) txSec = Math.floor(new Date(tx.createdAt).getTime() / 1e3);
@@ -717,7 +729,12 @@ async function calculateUserDailyData(user, startSec, endSec) {
       times++;
       const amt = Number(tx.amount) || 0;
       recharge += amt;
-      const r = tx.reward !== void 0 && tx.reward !== null && Number(tx.reward) > 0 ? Number(tx.reward) : Math.round(amt * 0.04 * 100) / 100;
+      let r = 0;
+      if (tx.reward !== void 0 && tx.reward !== null) {
+        r = Math.max(0, Number(tx.reward));
+      } else {
+        r = Math.round(amt * 0.04 * 100) / 100;
+      }
       reward += r;
     }
   }
@@ -3297,8 +3314,8 @@ var getNewbieUserData = async (req) => {
     totalBought = boughtTxs.reduce((sum, t) => sum + Math.abs(Number(t.amount || t.realAmount || 0)), 0);
     const hasLinkedUpiTool = Array.isArray(user.collectionTools) && user.collectionTools.some((t) => t && t.state !== 5 && t.state !== 0);
     hasLinkedUpi = hasLinkedUpiTool;
-    const isBuy1000Done = totalBought >= 1e3 || userParams.force_buyitoken === 1 || userParams.force_buyitoken === true;
-    userParams.newbie_buyitoken = isBuy1000Done ? 1 : 0;
+    const isBuy1000Done = totalBought >= 1e3 || userParams.force_buyitoken === 1 || userParams.force_buyitoken === true || user.recharge && Number(user.recharge) >= 1e3 || user.balance && Number(user.balance) >= 1e3;
+    userParams.newbie_buyitoken = isBuy1000Done ? 1 : userParams.newbie_buyitoken ? 1 : 0;
     if (hasLinkedUpiTool) userParams.newbie_newct = 1;
     if (userParams.newbie_tg_channel === void 0 || userParams.newbie_tg_channel === null) userParams.newbie_tg_channel = 1;
     if (userParams.newbie_tg_customer === void 0 || userParams.newbie_tg_customer === null) userParams.newbie_tg_customer = 1;
@@ -3308,13 +3325,23 @@ var getNewbieUserData = async (req) => {
     await user.save().catch(() => {
     });
   }
+  const isBuyTaskDone = Boolean(totalBought >= 1e3 || userParams.newbie_buyitoken === 1 || userParams.force_buyitoken === 1 || user && user.recharge && Number(user.recharge) >= 1e3);
+  const allTasksCompleted = Boolean(
+    (userParams.newbie_tg_channel == 1 || userParams.newbie_tg_channel === true) && (userParams.newbie_tg_customer == 1 || userParams.newbie_tg_customer === true) && (userParams.newbie_watch_video == 1 || userParams.newbie_watch_video === true) && (userParams.newbie_newct == 1 || userParams.newbie_newct === true || hasLinkedUpi) && (userParams.newbie_buyitoken == 1 || userParams.newbie_buyitoken === true || isBuyTaskDone)
+  );
+  if (allTasksCompleted) {
+    userParams.newbie_tg_channel = 1;
+    userParams.newbie_tg_customer = 1;
+    userParams.newbie_watch_video = 1;
+    userParams.newbie_newct = 1;
+    userParams.newbie_buyitoken = 1;
+  }
   const cappedBought = Math.min(1e3, Math.max(0, totalBought));
   const rules = buildNewbieRules(userParams, cappedBought, hasLinkedUpi);
-  const allTasksCompleted = Boolean(
-    (userParams.newbie_tg_channel === 1 || userParams.newbie_tg_channel === true) && (userParams.newbie_tg_customer === 1 || userParams.newbie_tg_customer === true) && (userParams.newbie_watch_video === 1 || userParams.newbie_watch_video === true) && (userParams.newbie_newct === 1 || userParams.newbie_newct === true || hasLinkedUpi) && (userParams.newbie_buyitoken === 1 || userParams.newbie_buyitoken === true)
-  );
   let isDone = 0;
-  const isClaimed = Boolean(user && (user.newbieClaimed === true || user.newbieDone === "claimed" || user.newbieDone === 2));
+  const isClaimed = Boolean(
+    user && (user.newbieClaimed === true || user.newbieDone === "claimed" || user.newbieDone === 2 || user.newbieDone === "2")
+  );
   if (isClaimed) {
     isDone = 2;
   } else if (allTasksCompleted) {
@@ -3322,7 +3349,7 @@ var getNewbieUserData = async (req) => {
   }
   return { user, userParams, rules, isDone, totalBought, cappedBought, allTasksCompleted, isClaimed };
 };
-app.get("/xxapi/newbieDayStep/init", async (req, res) => {
+app.get(["/xxapi/newbieDayStep/init", "/newbieDayStep/init"], async (req, res) => {
   const { userParams, rules, isDone, cappedBought, allTasksCompleted, isClaimed } = await getNewbieUserData(req);
   return res.json({
     code: 0,
@@ -3334,25 +3361,25 @@ app.get("/xxapi/newbieDayStep/init", async (req, res) => {
         status: isDone,
         finish: isDone,
         condition: 1e3,
-        settleAmt: isDone >= 1 ? 200 : 0,
+        settleAmt: isClaimed ? 200 : 0,
         params: JSON.stringify(userParams)
       },
       activityRules: rules,
       guides: rules,
       allDone: isClaimed,
-      // false while ready to claim, true after claimed
       finishNewbie: isDone,
       finish: isDone,
-      canClaim: isDone === 1,
-      claimable: isDone === 1,
-      enableReceive: isDone === 1,
+      canClaim: isDone === 1 && !isClaimed,
+      claimable: isDone === 1 && !isClaimed,
+      enableReceive: isDone === 1 && !isClaimed,
       receiveStatus: isDone,
-      buttonState: isDone === 1 ? 1 : isClaimed ? 2 : 0,
+      settleAmt: isClaimed ? 200 : 0,
+      buttonState: isClaimed ? 2 : isDone === 1 ? 1 : 0,
       buyToken: String(cappedBought)
     }
   });
 });
-app.get("/xxapi/newbieStepTotal/init", async (req, res) => {
+app.get(["/xxapi/newbieStepTotal/init", "/newbieStepTotal/init"], async (req, res) => {
   const { userParams, rules, isDone, cappedBought, allTasksCompleted, isClaimed } = await getNewbieUserData(req);
   return res.json({
     code: 0,
@@ -3364,7 +3391,7 @@ app.get("/xxapi/newbieStepTotal/init", async (req, res) => {
         status: isDone,
         finish: isDone,
         condition: 1e3,
-        settleAmt: isDone >= 1 ? 200 : 0,
+        settleAmt: isClaimed ? 200 : 0,
         params: JSON.stringify(userParams)
       },
       newbieStepRecord: {
@@ -3372,23 +3399,23 @@ app.get("/xxapi/newbieStepTotal/init", async (req, res) => {
         status: isDone,
         finish: isDone,
         condition: 1e3,
-        settleAmt: isDone >= 1 ? 200 : 0,
+        settleAmt: isClaimed ? 200 : 0,
         params: "{}"
       },
       activityRules: rules,
       guides: rules,
       tgGroup: "https://t.me/+4F3O2KrkP98yZjk1",
       newbieReward: 200,
+      settleAmt: isClaimed ? 200 : 0,
       buyToken: String(cappedBought),
       allDone: isClaimed,
-      // false while ready to claim, true after claimed
       finishNewbie: isDone,
       finish: isDone,
-      canClaim: isDone === 1,
-      claimable: isDone === 1,
-      enableReceive: isDone === 1,
+      canClaim: isDone === 1 && !isClaimed,
+      claimable: isDone === 1 && !isClaimed,
+      enableReceive: isDone === 1 && !isClaimed,
       receiveStatus: isDone,
-      buttonState: isDone === 1 ? 1 : isClaimed ? 2 : 0
+      buttonState: isClaimed ? 2 : isDone === 1 ? 1 : 0
     }
   });
 });
@@ -3404,10 +3431,15 @@ async function getInviteNewbieData(req) {
     ]
   });
   const paramsObj = {};
+  const inviteStepParamsObj = {};
+  const dayStepParamsObj = {};
+  const dayStepParamsForInviteDayStep = {};
+  const claimedPhones = Array.isArray(user.claimedInviteFriendPhones) ? user.claimedInviteFriendPhones : [];
   let completedCount = 0;
+  let unclaimedEligibleCount = 0;
   for (const m of directMembers) {
     const friendPhone = m.phone || m.mobileNo || `User_${m._id.toString().slice(-4)}`;
-    const isFriendDone = m.newbieDone || false;
+    const isFriendDone = m.newbieDone === 2 || m.newbieDone === "claimed" || m.newbieClaimed === true || m.newbieDone === true || m.newbieDone === 1;
     let friendTotalBought = 0;
     if (!isFriendDone) {
       const boughtTxs = await Transaction.find({
@@ -3421,76 +3453,103 @@ async function getInviteNewbieData(req) {
       });
       friendTotalBought = boughtTxs.reduce((sum, t) => sum + (t.amount || 0), 0);
     }
-    const friendDone = isFriendDone || friendTotalBought >= 1e3;
-    if (friendDone) {
+    const friendDone = isFriendDone || friendTotalBought >= 1e3 || Boolean(m.recharge && Number(m.recharge) >= 1e3);
+    const isFriendClaimed = claimedPhones.includes(friendPhone) || claimedPhones.includes(m._id.toString()) || m.phone && claimedPhones.includes(m.phone) || m.mobileNo && claimedPhones.includes(m.mobileNo);
+    if (isFriendClaimed) {
       completedCount++;
+      paramsObj[friendPhone] = "2";
+      inviteStepParamsObj[friendPhone] = "200,200";
+      dayStepParamsObj[friendPhone] = { "1000": "1000,200,1000,0,2" };
+      dayStepParamsForInviteDayStep[friendPhone] = "200,200,200,0,1000";
+    } else if (friendDone) {
+      completedCount++;
+      unclaimedEligibleCount++;
       paramsObj[friendPhone] = "1";
+      inviteStepParamsObj[friendPhone] = "200,0";
+      dayStepParamsObj[friendPhone] = { "1000": "1000,200,1000,0,2" };
+      dayStepParamsForInviteDayStep[friendPhone] = "200,0,200,0,1000";
     } else {
       paramsObj[friendPhone] = "0";
+      inviteStepParamsObj[friendPhone] = "200,0";
+      dayStepParamsObj[friendPhone] = { "1000": "1000,200,0,0,0" };
+      dayStepParamsForInviteDayStep[friendPhone] = "200,0,0,0,0";
     }
   }
-  const claimedCount = user.claimedInviteNewbieCount || 0;
+  const claimedCount = claimedPhones.length;
   const claimedAmt = claimedCount * 200;
   return {
     user,
     directMembers,
     paramsObj,
+    inviteStepParamsObj,
+    dayStepParamsObj,
+    dayStepParamsForInviteDayStep,
     totalFriends: directMembers.length,
     completedCount,
     claimedCount,
-    claimedAmt
+    claimedAmt,
+    claimedPhones,
+    unclaimedEligibleCount
   };
 }
 app.get(["/xxapi/inviteNewbieStepTotal/init", "/xxapi/oldRptNew/init"], async (req, res) => {
   const data = await getInviteNewbieData(req);
   if (!data) return res.json({ code: 403, msg: "Unauthorized" });
-  const { paramsObj, completedCount, claimedCount, claimedAmt } = data;
+  const { paramsObj, inviteStepParamsObj, dayStepParamsObj, claimedCount, claimedAmt } = data;
   return res.json({
     code: 0,
     msg: "success",
     data: {
       activityRecord: {
-        done: completedCount > claimedCount ? 1 : 0,
         condition: claimedCount,
         settleAmt: claimedAmt,
         params: JSON.stringify(paramsObj)
       },
       inviteDayStepRecord: {
         done: 0,
-        condition: 0,
-        settleAmt: 0,
-        params: "{}"
+        condition: claimedCount,
+        settleAmt: claimedAmt,
+        params: JSON.stringify(inviteStepParamsObj)
       },
       oldRptNewReward: {
         fixed: 200,
         rule: JSON.stringify({ "1": 200 })
       },
-      dayStepParams: "{}",
+      dayStepParams: JSON.stringify(dayStepParamsObj),
       activityRules: [],
       allDone: false
     }
   });
 });
-app.post("/xxapi/oldRptNew/reward", async (req, res) => {
+app.post(["/xxapi/oldRptNew/reward", "/xxapi/inviteNewbieStepTotal/reward"], async (req, res) => {
   const data = await getInviteNewbieData(req);
   if (!data) return res.json({ code: 403, msg: "Unauthorized" });
-  const { user, completedCount, claimedCount } = data;
-  const unclaimedCount = completedCount - claimedCount;
-  if (unclaimedCount <= 0) {
-    return res.json({ code: 1, msg: "No new completed newbie friends to claim." });
+  const { user, directMembers, claimedPhones } = data;
+  const newlyClaimableFriends = directMembers.filter((m) => {
+    const friendPhone = m.phone || m.mobileNo || `User_${m._id.toString().slice(-4)}`;
+    const isFriendDone = m.newbieDone === 2 || m.newbieDone === "claimed" || m.newbieClaimed === true || m.newbieDone === true || m.newbieDone === 1;
+    const isClaimed = claimedPhones.includes(friendPhone) || claimedPhones.includes(m._id.toString()) || m.phone && claimedPhones.includes(m.phone) || m.mobileNo && claimedPhones.includes(m.mobileNo);
+    return isFriendDone && !isClaimed;
+  });
+  if (newlyClaimableFriends.length === 0) {
+    return res.json({ code: 1, msg: "Already claimed! Only 1 reward of \u20B9200 per friend is allowed." });
   }
+  const unclaimedCount = newlyClaimableFriends.length;
   const rewardAmt = unclaimedCount * 200;
-  const currentClaimed = Number(user.claimedInviteNewbieCount || 0);
+  const newlyClaimedKeys = [];
+  newlyClaimableFriends.forEach((f) => {
+    if (f.phone) newlyClaimedKeys.push(f.phone);
+    if (f.mobileNo) newlyClaimedKeys.push(f.mobileNo);
+    if (f._id) newlyClaimedKeys.push(f._id.toString());
+  });
+  const updatedClaimedPhones = Array.from(/* @__PURE__ */ new Set([...claimedPhones, ...newlyClaimedKeys]));
   const updatedUser = await User.findOneAndUpdate(
+    { _id: user._id },
     {
-      _id: user._id,
-      $or: [
-        { claimedInviteNewbieCount: currentClaimed },
-        { claimedInviteNewbieCount: { $exists: false } }
-      ]
-    },
-    {
-      $set: { claimedInviteNewbieCount: claimedCount + unclaimedCount },
+      $set: {
+        claimedInviteNewbieCount: updatedClaimedPhones.length,
+        claimedInviteFriendPhones: updatedClaimedPhones
+      },
       $inc: { balance: rewardAmt }
     },
     { new: true }
@@ -3506,6 +3565,7 @@ app.post("/xxapi/oldRptNew/reward", async (req, res) => {
     amount: rewardAmt,
     reward: 0,
     isBalanceCredited: true,
+    isAdminAddition: true,
     type: "transfer_in",
     payer_status: 3,
     reason_for_rejection: `Invite Newbie Reward (${unclaimedCount} friends)`,
@@ -3514,16 +3574,41 @@ app.post("/xxapi/oldRptNew/reward", async (req, res) => {
   });
   await newTx.save().catch(() => {
   });
-  console.log(`[Invite Reward] User ${updatedUser.phone} claimed \u20B9${rewardAmt} for ${unclaimedCount} friends.`);
+  console.log(`[Invite Reward] User ${updatedUser.phone} claimed one-time \u20B9${rewardAmt} for ${unclaimedCount} friends.`);
   return res.json({ code: 0, msg: "success", data: { rewardAmt } });
 });
 async function claimNewbieRewardAtomically(user) {
   if (!user || !user._id) return false;
+  const uId = user._id ? isValidObjectId(user._id) ? new import_mongoose.default.Types.ObjectId(user._id) : user._id : null;
+  const userIds = [user._id, user._id ? user._id.toString() : "", uId].filter(Boolean);
+  const phones = [user.phone, user.mobileNo].filter(Boolean);
+  const existingRewardTx = await Transaction.findOne({
+    $and: [
+      {
+        $or: [
+          { userId: { $in: userIds } },
+          { phone: { $in: phones } }
+        ]
+      },
+      {
+        $or: [
+          { rptNo: /^NWB/i },
+          { reason_for_rejection: /Newbie Reward/i }
+        ]
+      }
+    ]
+  });
+  if (existingRewardTx) {
+    await User.updateOne(
+      { $or: [{ _id: { $in: userIds } }, { phone: { $in: phones } }] },
+      { $set: { newbieClaimed: true, newbieDone: 2 } }
+    ).catch(() => {
+    });
+    return true;
+  }
   const updatedUser = await User.findOneAndUpdate(
     {
-      _id: user._id,
-      newbieClaimed: { $ne: true },
-      newbieDone: { $nin: ["claimed", 2, true] }
+      $or: [{ _id: { $in: userIds } }, { phone: { $in: phones } }]
     },
     {
       $set: {
@@ -3536,27 +3621,26 @@ async function claimNewbieRewardAtomically(user) {
     },
     { new: true }
   ).catch(() => null);
-  if (updatedUser) {
-    const rptNo = "NWB" + Date.now() + Math.floor(Math.random() * 1e3);
-    const newTx = new Transaction({
-      userId: updatedUser._id,
-      phone: updatedUser.phone || updatedUser.mobileNo,
-      rptNo,
-      amount: 200,
-      reward: 0,
-      isBalanceCredited: true,
-      type: "reward",
-      payer_status: 3,
-      reason_for_rejection: "Newbie Reward (\u20B9200)",
-      ctime: Math.floor(Date.now() / 1e3),
-      currentStep: 2
-    });
-    await newTx.save().catch(() => {
-    });
-    console.log(`[Newbie Reward] User ${updatedUser.phone} atomically claimed \u20B9200 newbie reward.`);
-    return true;
-  }
-  return false;
+  const targetUser = updatedUser || user;
+  const rptNo = "NWB" + Date.now() + Math.floor(Math.random() * 1e3);
+  const newTx = new Transaction({
+    userId: targetUser._id,
+    phone: targetUser.phone || targetUser.mobileNo,
+    rptNo,
+    amount: 200,
+    reward: 0,
+    isBalanceCredited: true,
+    isAdminAddition: true,
+    type: "reward",
+    payer_status: 3,
+    reason_for_rejection: "Newbie Reward (\u20B9200)",
+    ctime: Math.floor(Date.now() / 1e3),
+    currentStep: 2
+  });
+  await newTx.save().catch(() => {
+  });
+  console.log(`[Newbie Reward] User ${targetUser.phone} atomically claimed \u20B9200 newbie reward. Balance is now ${targetUser.balance}`);
+  return true;
 }
 app.all([
   "/xxapi/newbieDayStep/reward",
@@ -3564,26 +3648,95 @@ app.all([
   "/xxapi/newbieDayStep/settle",
   "/xxapi/newbieStepTotal/settle",
   "/xxapi/bguide/reward",
-  "/xxapi/bguide/settle"
+  "/xxapi/bguide/settle",
+  "/bguide/reward",
+  "/newbieDayStep/reward",
+  "/newbieStepTotal/reward"
 ], async (req, res) => {
   const user = await getUserByToken(req);
   if (!user) return res.json({ code: 403, msg: "Unauthorized" });
   await claimNewbieRewardAtomically(user);
-  return res.json({ code: 0, msg: "success", data: { reward: 200, rewardAmt: 200, settleAmt: 200 } });
-});
-app.get("/xxapi/inviteDayStep/init", async (req, res) => {
   return res.json({
     code: 0,
     msg: "success",
     data: {
-      activityRecord: { done: 0, condition: 0, settleAmt: 0, params: "{}" },
+      reward: 200,
+      rewardAmt: 200,
+      settleAmt: 200,
+      status: 2,
+      done: 1,
+      isDone: 2
+    }
+  });
+});
+app.get("/xxapi/inviteDayStep/init", async (req, res) => {
+  const data = await getInviteNewbieData(req);
+  return res.json({
+    code: 0,
+    msg: "success",
+    data: {
+      activityRecord: {
+        done: 0,
+        condition: data?.claimedCount || 0,
+        settleAmt: data?.claimedAmt || 0,
+        params: JSON.stringify(data?.dayStepParamsForInviteDayStep || {})
+      },
       activityRules: [],
       allDone: false
     }
   });
 });
-app.post("/xxapi/inviteDayStep/reward/:id", async (req, res) => {
-  return res.json({ code: 0, msg: "success" });
+app.post(["/xxapi/inviteDayStep/reward/:id", "/xxapi/inviteDayStep/reward"], async (req, res) => {
+  const user = await getUserByToken(req);
+  if (!user) return res.json({ code: 403, msg: "Unauthorized" });
+  const friendKey = req.params.id || req.body.id || req.query.id;
+  if (!friendKey) return res.json({ code: 1, msg: "Friend identifier required" });
+  const claimedPhones = Array.isArray(user.claimedInviteFriendPhones) ? user.claimedInviteFriendPhones : [];
+  const directMember = await User.findOne({
+    $or: [{ phone: friendKey }, { mobileNo: friendKey }, ...isValidObjectId(friendKey) ? [{ _id: friendKey }] : []]
+  });
+  if (!directMember) {
+    return res.json({ code: 1, msg: "Invited friend not found." });
+  }
+  const memberKeys = [friendKey, directMember.phone, directMember.mobileNo, directMember._id.toString()].filter(Boolean);
+  const alreadyClaimed = memberKeys.some((k) => claimedPhones.includes(k));
+  if (alreadyClaimed) {
+    return res.json({ code: 1, msg: "Reward for this friend has already been claimed! Only 1 reward of \u20B9200 allowed." });
+  }
+  const updatedClaimedPhones = Array.from(/* @__PURE__ */ new Set([...claimedPhones, ...memberKeys]));
+  const updatedUser = await User.findOneAndUpdate(
+    { _id: user._id },
+    {
+      $set: {
+        claimedInviteNewbieCount: updatedClaimedPhones.length,
+        claimedInviteFriendPhones: updatedClaimedPhones
+      },
+      $inc: { balance: 200 }
+    },
+    { new: true }
+  ).catch(() => null);
+  if (!updatedUser) {
+    return res.json({ code: 1, msg: "Already claimed or processing." });
+  }
+  const rptNo = "INV" + Date.now() + Math.floor(Math.random() * 1e3);
+  const newTx = new Transaction({
+    userId: updatedUser._id,
+    phone: updatedUser.phone || updatedUser.mobileNo,
+    rptNo,
+    amount: 200,
+    reward: 0,
+    isBalanceCredited: true,
+    isAdminAddition: true,
+    type: "transfer_in",
+    payer_status: 3,
+    reason_for_rejection: `Invite Friend Step Reward (${friendKey})`,
+    ctime: Math.floor(Date.now() / 1e3),
+    currentStep: 2
+  });
+  await newTx.save().catch(() => {
+  });
+  console.log(`[Invite Step Reward] User ${updatedUser.phone} claimed \u20B9200 for friend ${friendKey}. Button is now disabled.`);
+  return res.json({ code: 0, msg: "Successfully claimed \u20B9200 for this friend!" });
 });
 app.get("/xxapi/buyInrTimes/init", async (req, res) => {
   return res.json({
@@ -3711,9 +3864,6 @@ app.all([
   }
   return res.json({ code: 0, msg: "success" });
 });
-app.post("/xxapi/bguide/reward", async (req, res) => {
-  return res.json({ code: 0, msg: "success" });
-});
 app.get("/xxapi/todayLotteryReward/init", async (req, res) => {
   return res.json({
     code: 0,
@@ -3834,9 +3984,9 @@ app.get("/xxapi/bank/history", async (req, res) => {
       const ss = String(d.getSeconds()).padStart(2, "0");
       return;
     };
-    const debitTimeStr2 = formatTsString(debitTimeSec);
-    const dealTimeStr2 = formatTsString(dealTimeSec);
-    const finishTimeStr2 = formatTsString(finishTimeSec);
+    const debitTimeStr = formatTsString(debitTimeSec);
+    const dealTimeStr = formatTsString(dealTimeSec);
+    const finishTimeStr = formatTsString(finishTimeSec);
     const sellerReceiveUpi = tx.payee_bank_account || tx.upi || "";
     return {
       ...obj,
@@ -5005,13 +5155,26 @@ app.post("/xxapi/buyitoken/pickuppaymentslip", async (req, res) => {
   }
   if (sellerUserId || sellerPhoneVal || payee_bank_account) {
     try {
+      if (!sellerUserId && payee_bank_account) {
+        const foundSeller = await User.findOne({
+          $or: [
+            { "collectionTools.upi": payee_bank_account },
+            { "collectionTools.account": payee_bank_account },
+            { "upiDetails.upi": payee_bank_account }
+          ]
+        });
+        if (foundSeller) {
+          sellerUserId = foundSeller._id;
+          if (!sellerPhoneVal) sellerPhoneVal = foundSeller.phone || foundSeller.mobileNo || "";
+        }
+      }
       const sellerSellRptNo = `SELL_${order_id}`;
       let sellerTx = await Transaction.findOne({ rptNo: sellerSellRptNo });
       const activePayerStatus = slipData && slipData.payer_status ? slipData.payer_status : 1;
       if (!sellerTx) {
         sellerTx = new Transaction({
-          userId: sellerUserId || user._id,
-          sellerId: sellerUserId || user._id,
+          userId: sellerUserId || null,
+          sellerId: sellerUserId || null,
           sellerPhone: sellerPhoneVal || "",
           phone: sellerPhoneVal || "",
           buyerPhone: user.phone || "",
@@ -5215,6 +5378,8 @@ app.post("/xxapi/buyitoken/processpaymentslips", async (req, res) => {
   const { order_id, process: processType, cancel_remark, proof_payment } = req.body;
   const tx = await Transaction.findOne({ rptNo: order_id });
   if (tx) {
+    const sellerSellRptNo = `SELL_${order_id}`;
+    let sellerTx = await Transaction.findOne({ rptNo: sellerSellRptNo });
     if (processType === "finish") {
       tx.payer_status = 2;
       const nowSec = Math.floor(Date.now() / 1e3);
@@ -5223,6 +5388,13 @@ app.post("/xxapi/buyitoken/processpaymentslips", async (req, res) => {
       if (req.body && req.body.utr) tx.utr = String(req.body.utr).trim();
       if (proof_payment) tx.paymentProof = proof_payment;
       await tx.save();
+      if (sellerTx) {
+        sellerTx.payer_status = 2;
+        if (tx.utr) sellerTx.utr = tx.utr;
+        sellerTx.dealTime = nowSec;
+        sellerTx.utime = nowSec;
+        await sellerTx.save();
+      }
       await handleOrderEnteredInReview(tx);
     } else if (processType === "cancel" || processType === "Cancel") {
       tx.payer_status = 4;
@@ -5230,6 +5402,14 @@ app.post("/xxapi/buyitoken/processpaymentslips", async (req, res) => {
       tx.finishTime = nowSec;
       tx.fnsDate = nowSec;
       if (cancel_remark) tx.cancelRemark = cancel_remark;
+      await tx.save();
+      if (sellerTx) {
+        sellerTx.payer_status = 4;
+        sellerTx.finishTime = nowSec;
+        sellerTx.fnsDate = nowSec;
+        if (cancel_remark) sellerTx.cancelRemark = cancel_remark;
+        await sellerTx.save();
+      }
     }
     await tx.save();
   }
@@ -7847,11 +8027,11 @@ async function getRechargeHistory(req, res) {
       const ss = String(d.getSeconds()).padStart(2, "0");
       return `${YYYY}-${MM}-${DD} ${hh}:${mm}:${ss}`;
     };
-    const debitTimeStr2 = formatTsString(debitTimeSec);
-    const dealTimeStr2 = formatTsString(dealTimeSec);
-    let finishTimeStr2 = formatTsString(finishTimeSec);
-    if ((tx.payer_status === 3 || orderState === 3) && (!finishTimeStr2 || finishTimeStr2 === "")) {
-      finishTimeStr2 = dealTimeStr2 || debitTimeStr2;
+    const debitTimeStr = formatTsString(debitTimeSec);
+    const dealTimeStr = formatTsString(dealTimeSec);
+    let finishTimeStr = formatTsString(finishTimeSec);
+    if ((tx.payer_status === 3 || orderState === 3) && (!finishTimeStr || finishTimeStr === "")) {
+      finishTimeStr = dealTimeStr || debitTimeStr;
     }
     const isUsdtTx = tx.isUsdt === true || String(tx.rptNo || "").startsWith("USDT");
     let effectiveAmount = Number(tx.amount || 0);
@@ -7946,15 +8126,15 @@ async function getRechargeHistory(req, res) {
       crtDate: debitTimeSec * 1e3,
       uptDate: dealTimeSec * 1e3,
       fnsDate: finishTimeSec ? finishTimeSec * 1e3 : 0,
-      "Debit time": debitTimeStr2,
-      debitTime: debitTimeStr2,
-      debit_time: debitTimeStr2,
-      "Deal time": dealTimeStr2,
-      dealTime: dealTimeStr2,
-      deal_time: dealTimeStr2,
-      "Finish time": finishTimeStr2,
-      finishTime: finishTimeStr2,
-      finish_time: finishTimeStr2,
+      "Debit time": debitTimeStr,
+      debitTime: debitTimeStr,
+      debit_time: debitTimeStr,
+      "Deal time": dealTimeStr,
+      dealTime: dealTimeStr,
+      deal_time: dealTimeStr,
+      "Finish time": finishTimeStr,
+      finishTime: finishTimeStr,
+      finish_time: finishTimeStr,
       secLimit: tx.countdown || 1800
     };
   }));
@@ -8008,6 +8188,14 @@ app.post(["/xxapi/buyitoken/confirmPayment", "/xxapi/confirmPayment"], async (re
   tx.payer_status = 2;
   tx.currentStep = 2;
   await tx.save();
+  const sellerSellRptNo = `SELL_${rptNo}`;
+  const sellerTx = await Transaction.findOne({ rptNo: sellerSellRptNo });
+  if (sellerTx) {
+    if (tx.utr) sellerTx.utr = tx.utr;
+    sellerTx.payer_status = 2;
+    sellerTx.currentStep = 2;
+    await sellerTx.save();
+  }
   buyerActiveOrderMap.clear();
   return res.json({
     code: 0,
@@ -8116,16 +8304,30 @@ async function getSellHistory(req, res) {
   try {
     const user = await getUserByToken(req);
     if (!user) return res.json({ code: 403, msg: "Unauthorized" });
-    const userIds = [user._id, user._id ? user._id.toString() : ""].filter(Boolean);
+    const userIds = [user._id, user._id ? user._id.toString() : "", user.id, user.userId].filter(Boolean);
     const userObjIds = userIds.map((id) => {
       try {
-        return new import_mongoose.default.Types.ObjectId(id);
+        return isValidObjectId(id) ? new import_mongoose.default.Types.ObjectId(id) : null;
       } catch (e) {
         return null;
       }
     }).filter(Boolean);
     const allUserIds = [...userIds, ...userObjIds];
-    const phones = [user.phone, user.mobileNo].filter(Boolean);
+    const rawPhones = [user.phone, user.mobileNo, user.telephone, user.phoneNo].filter(Boolean);
+    const phonesSet = /* @__PURE__ */ new Set();
+    for (const p of rawPhones) {
+      const pStr = String(p).trim();
+      phonesSet.add(pStr);
+      const digits = pStr.replace(/\D/g, "");
+      if (digits.length >= 10) {
+        const last10 = digits.slice(-10);
+        phonesSet.add(last10);
+        phonesSet.add(`+91${last10}`);
+        phonesSet.add(`91${last10}`);
+        phonesSet.add(`0${last10}`);
+      }
+    }
+    const phones = Array.from(phonesSet);
     const upiAccounts = [];
     if (user.upi) upiAccounts.push(user.upi);
     if (user.upiId) upiAccounts.push(user.upiId);
@@ -8153,16 +8355,17 @@ async function getSellHistory(req, res) {
       });
     }
     const cleanUpis = Array.from(new Set(upiAccounts.map((a) => String(a).trim()).filter(Boolean)));
+    const upiRegexes = cleanUpis.map((u) => new RegExp(`^${u.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"));
     const sellerOrConditions = [
       { sellerId: { $in: allUserIds } },
       { sellerPhone: { $in: phones } },
       { seller_phone: { $in: phones } },
       { userId: { $in: allUserIds }, type: { $in: ["sell", "SELL", "withdraw", "sellitoken", "sell_itoken", "sell_inr"] } },
       { phone: { $in: phones }, type: { $in: ["sell", "SELL", "withdraw", "sellitoken", "sell_itoken", "sell_inr"] } },
-      { rptNo: /^SELL_/i, $or: [{ userId: { $in: allUserIds } }, { phone: { $in: phones } }, { sellerId: { $in: allUserIds } }] }
+      { rptNo: /^SELL_/i, $or: [{ userId: { $in: allUserIds } }, { phone: { $in: phones } }, { sellerId: { $in: allUserIds } }, { sellerPhone: { $in: phones } }] }
     ];
-    if (cleanUpis.length > 0) {
-      sellerOrConditions.push({ payee_bank_account: { $in: cleanUpis } });
+    if (upiRegexes.length > 0) {
+      sellerOrConditions.push({ payee_bank_account: { $in: upiRegexes } });
     }
     const queryFilter = { $or: sellerOrConditions };
     const rawStatus = req.query.status ?? req.body?.status ?? req.query.state ?? req.body?.state ?? req.query.orderState ?? req.body?.orderState ?? req.query.order_state ?? req.body?.order_state ?? req.query.tab ?? req.body?.tab ?? "";
@@ -8177,21 +8380,30 @@ async function getSellHistory(req, res) {
     const uniqueTxMap = /* @__PURE__ */ new Map();
     for (const tx of allSellerTxs) {
       const rawRpt = tx.rptNo || (tx._id ? tx._id.toString() : "");
-      const baseRpt = rawRpt.replace(/^SELL_/i, "").trim();
+      const baseRpt = String(rawRpt).replace(/^SELL_/i, "").trim();
       const buyerTx = buyerTxMap.get(baseRpt);
-      const isCancelled = tx.payer_status === 4 || tx.payer_status === 5 || buyerTx?.payer_status === 4 || buyerTx?.payer_status === 5 || isOrderCancelledForUser("", baseRpt) || baseRpt && orderSlipMap.get(baseRpt)?.payer_status === 4;
+      const isCancelled = tx.payer_status === 4 || tx.payer_status === 5 || buyerTx?.payer_status === 4 || buyerTx?.payer_status === 5 || isOrderCancelledForUser("", baseRpt) || isOrderCancelledForUser("", rawRpt) || baseRpt && orderSlipMap.get(baseRpt)?.payer_status === 4;
       const isSuccess = tx.payer_status === 3 || buyerTx?.payer_status === 3;
       let realStatus = tx.payer_status;
-      if (isCancelled) realStatus = 4;
-      else if (isSuccess) realStatus = 3;
+      if (isCancelled) {
+        realStatus = 4;
+      } else if (isSuccess) {
+        realStatus = 3;
+      } else if (tx.payer_status === 2 || buyerTx?.payer_status === 2) {
+        realStatus = 2;
+      } else {
+        realStatus = 1;
+      }
       tx.payer_status = realStatus;
+      tx.utr = tx.utr || buyerTx?.utr || tx.ref_no || buyerTx?.ref_no || "";
       if (buyerTx?.cancelled_by) tx.cancelled_by = buyerTx.cancelled_by;
       const existing = uniqueTxMap.get(baseRpt);
       if (!existing) {
         uniqueTxMap.set(baseRpt, tx);
       } else {
+        if (tx.utr && !existing.utr) existing.utr = tx.utr;
         if (tx.type === "sell" || rawRpt.startsWith("SELL_")) {
-          uniqueTxMap.set(baseRpt, tx);
+          uniqueTxMap.set(baseRpt, { ...existing, ...tx, utr: tx.utr || existing.utr });
         }
       }
     }
@@ -8199,21 +8411,21 @@ async function getSellHistory(req, res) {
     deduplicatedTxs = deduplicatedTxs.filter((tx) => {
       if (!tx) return false;
       const txType = String(tx.type || "").toLowerCase();
-      const isUserSeller = tx.sellerId && (tx.sellerId.toString() === user._id.toString() || userIds.includes(tx.sellerId.toString())) || tx.sellerPhone && phones.includes(tx.sellerPhone) || tx.payee_bank_account && cleanUpis.some((u) => u && tx.payee_bank_account.toLowerCase().trim().includes(u)) || txType === "sell" || String(tx.rptNo || "").startsWith("SELL_");
+      const isUserSeller = tx.sellerId && (tx.sellerId.toString() === user._id.toString() || userIds.includes(tx.sellerId.toString())) || tx.sellerPhone && phones.includes(tx.sellerPhone) || tx.payee_bank_account && cleanUpis.some((u) => u && tx.payee_bank_account.toLowerCase().trim().includes(u.toLowerCase())) || txType === "sell" || String(tx.rptNo || "").startsWith("SELL_");
       if (isUserSeller) {
         return true;
       }
       const isUserBuyer = tx.buyerUserId && (tx.buyerUserId.toString() === user._id.toString() || userIds.includes(tx.buyerUserId.toString())) || tx.buyerPhone && phones.includes(tx.buyerPhone) || tx.userId && (tx.userId.toString() === user._id.toString() || userIds.includes(tx.userId.toString())) && ["buy", "recharge", "buyitoken", "deposit", "admin"].includes(txType);
-      if (isUserBuyer || ["buy", "recharge", "buyitoken", "deposit"].includes(txType)) {
+      if (isUserBuyer) {
         return false;
       }
       return true;
     });
-    if (["1", "2", "paying", "dispatched", "undispatched", "pending", "in_progress", "active", "paying_status"].some((s) => statusStr.includes(s) || statusStr === s)) {
+    if (statusStr === "1" || statusStr === "paying" || statusStr === "dispatched") {
       deduplicatedTxs = deduplicatedTxs.filter((t) => t.payer_status === 1 || t.payer_status === 2);
-    } else if (["3", "success", "successfully", "done", "completed"].some((s) => statusStr.includes(s) || statusStr === s)) {
+    } else if (statusStr === "3" || statusStr === "success" || statusStr === "completed") {
       deduplicatedTxs = deduplicatedTxs.filter((t) => t.payer_status === 3);
-    } else if (["4", "5", "cancel", "cancelled", "failed", "offline"].some((s) => statusStr.includes(s) || statusStr === s)) {
+    } else if (statusStr === "4" || statusStr === "cancel" || statusStr === "cancelled") {
       deduplicatedTxs = deduplicatedTxs.filter((t) => t.payer_status === 4 || t.payer_status === 5);
     }
     const page = Number(req.query.page) || Number(req.body?.page) || 1;
@@ -8225,7 +8437,7 @@ async function getSellHistory(req, res) {
       const cleanRptNo = String(rawRpt).replace(/^SELL_/i, "").trim();
       const isCancelled = tx.payer_status === 4 || tx.payer_status === 5 || isOrderCancelledForUser("", cleanRptNo);
       let effectivePayerStatus = isCancelled ? 4 : tx.payer_status;
-      let orderState = 2;
+      let orderState = 1;
       if (effectivePayerStatus === 1) orderState = 1;
       else if (effectivePayerStatus === 2) orderState = 2;
       else if (effectivePayerStatus === 3) orderState = 3;
@@ -8248,16 +8460,34 @@ async function getSellHistory(req, res) {
       const debitTimeSec = tx.ctime || Math.floor(Date.now() / 1e3);
       const dealTimeSec = tx.dealTime || tx.utime || (effectivePayerStatus >= 2 ? tx.updatedAt ? Math.floor(new Date(tx.updatedAt).getTime() / 1e3) : debitTimeSec : debitTimeSec);
       const finishTimeSec = tx.finishTime || tx.fnsDate || (effectivePayerStatus >= 3 ? tx.updatedAt ? Math.floor(new Date(tx.updatedAt).getTime() / 1e3) : debitTimeSec : 0);
+      const formatTs = (sec) => {
+        if (!sec) return "";
+        const d = new Date(sec * 1e3);
+        const YYYY = d.getFullYear();
+        const MM = String(d.getMonth() + 1).padStart(2, "0");
+        const DD = String(d.getDate()).padStart(2, "0");
+        const hh = String(d.getHours()).padStart(2, "0");
+        const mm = String(d.getMinutes()).padStart(2, "0");
+        const ss = String(d.getSeconds()).padStart(2, "0");
+        return `${YYYY}-${MM}-${DD} ${hh}:${mm}:${ss}`;
+      };
+      const debitTimeStr = formatTs(debitTimeSec);
+      const dealTimeStr = formatTs(dealTimeSec);
+      let finishTimeStr = formatTs(finishTimeSec);
+      if (effectivePayerStatus === 3 && !finishTimeStr) {
+        finishTimeStr = dealTimeStr || debitTimeStr;
+      }
       const sellerReceiveUpi = tx.payee_bank_account || tx.upi || "";
       const userPayerStatus = effectivePayerStatus === 4 || effectivePayerStatus === 5 ? 5 : effectivePayerStatus;
+      const realUtr = tx.utr || tx.ref_no || "";
       return {
         ...obj,
         id: cleanRptNo,
         rptNo: cleanRptNo,
         orderNo: cleanRptNo,
         order_id: cleanRptNo,
-        amount: tx.amount,
-        realAmount: tx.amount,
+        amount: Number(tx.amount || 0),
+        realAmount: Number(tx.amount || 0),
         orderState,
         order_state: orderState,
         state: orderState,
@@ -8303,7 +8533,7 @@ async function getSellHistory(req, res) {
         payee_upi: sellerReceiveUpi,
         "Debit time": debitTimeStr,
         "Deal time": dealTimeStr,
-        "Utr": tx.utr || tx.ref_no || "",
+        "Utr": realUtr || "NA",
         "Order status": effectivePayerStatus === 3 || orderState === 3 ? "Success" : effectivePayerStatus === 4 || effectivePayerStatus === 5 || orderState === 4 || orderState === 5 ? "Cancelled" : effectivePayerStatus === 1 || orderState === 1 ? "Paying" : "In Review",
         "Finish time": finishTimeStr,
         receiveAccount: sellerReceiveUpi,
@@ -8314,7 +8544,7 @@ async function getSellHistory(req, res) {
         payer_upi: tx.ct_account || tx.payer_upi || tx.ctAccount || "",
         ctAccount: tx.ct_account || tx.payer_upi || tx.ctAccount || "",
         ct_account: tx.ct_account || tx.payer_upi || tx.ctAccount || "",
-        utr: tx.utr || tx.ref_no || "",
+        utr: realUtr,
         payee_recipients_name: tx.payee_recipients_name || "Merchant Partner",
         pnname: tx.payee_recipients_name || "Merchant Partner",
         name: tx.payee_recipients_name || "Merchant Partner",
@@ -9817,18 +10047,23 @@ app.post("/xxapi/admin/addTransaction", requireAdmin, async (req, res) => {
     if (!user) {
       return res.status(404).json({ code: 404, msg: "User not found" });
     }
-    const rptNo = "TXN" + Date.now() + Math.floor(Math.random() * 1e3);
+    const isAdminAddition = true;
+    const rptNo = "ADM" + Date.now() + Math.floor(Math.random() * 1e3);
     const transaction = new Transaction({
       userId: user._id,
       phone: user.phone || user.mobileNo,
       rptNo,
       amount: Number(amount),
       utr: utr || "",
-      type,
-      // 'recharge', 'sell', 'admin'
+      type: type === "admin" ? "admin" : type === "sell" ? "sell" : "admin",
+      // Keep as admin addition
+      isAdminAddition: true,
+      // Mark so it never counts as buy profit on Today Profit page
+      reward: 0,
+      // Admin additions must never receive 4% profit
       payer_status: Number(status !== void 0 ? status : 3),
       // 3: success, 2: pending, 4: cancel
-      reason_for_rejection: reason || "",
+      reason_for_rejection: reason || "Admin Balance Adjustment",
       ctime: Math.floor(Date.now() / 1e3),
       currentStep: Number(status) === 3 ? 2 : 1
     });
