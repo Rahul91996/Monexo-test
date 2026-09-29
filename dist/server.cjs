@@ -350,6 +350,8 @@ var transactionSchema = new import_mongoose.default.Schema({
   payer_upi: { type: String, default: "" },
   payer_tool: { type: String, default: "" },
   isAdminAddition: { type: Boolean, default: false },
+  dealTime: { type: Number },
+  finishTime: { type: Number },
   seqNo: { type: String, default: "" },
   ctime: { type: Number, default: () => Math.floor(Date.now() / 1e3) },
   type: { type: String, default: "recharge" }
@@ -769,12 +771,19 @@ async function calculateUserDailyData(user, startSec, endSec) {
   });
   const level1Phones = level1Members.map((m) => m.phone).filter(Boolean);
   const level1Codes = level1Members.flatMap((m) => [m.ownInviteCode, m.referralCode, m.providerId, m._id ? m._id.toString() : ""].filter(Boolean));
+  const validDownlineBuyFilter = {
+    payer_status: 3,
+    type: { $in: ["buy", "recharge", "buyitoken", "BUY", "Buy"] },
+    isAdminAddition: { $ne: true },
+    isUsdt: { $ne: true },
+    rptNo: { $not: /^(ADM|TXN_ADM|NWB|INV|USDT|MANUAL)/i },
+    reason_for_rejection: { $not: /Admin|Manual|Adjustment|Add|Subtract|Bonus|Reward|Newbie|Invite/i },
+    ctime: { $gte: startSec, $lte: endSec }
+  };
   if (level1Phones.length > 0) {
     const l1BuyTxs = await Transaction.find({
       phone: { $in: level1Phones },
-      payer_status: 3,
-      type: { $ne: "sell" },
-      ctime: { $gte: startSec, $lte: endSec }
+      ...validDownlineBuyFilter
     });
     const l1Sum = l1BuyTxs.reduce((sum, t) => sum + (t.amount || 0), 0);
     dividend += l1Sum * 3e-3;
@@ -793,9 +802,7 @@ async function calculateUserDailyData(user, startSec, endSec) {
   if (level2Phones.length > 0) {
     const l2BuyTxs = await Transaction.find({
       phone: { $in: level2Phones },
-      payer_status: 3,
-      type: { $ne: "sell" },
-      ctime: { $gte: startSec, $lte: endSec }
+      ...validDownlineBuyFilter
     });
     const l2Sum = l2BuyTxs.reduce((sum, t) => sum + (t.amount || 0), 0);
     dividend += l2Sum * 2e-3;
@@ -813,9 +820,7 @@ async function calculateUserDailyData(user, startSec, endSec) {
   if (level3Phones.length > 0) {
     const l3BuyTxs = await Transaction.find({
       phone: { $in: level3Phones },
-      payer_status: 3,
-      type: { $ne: "sell" },
-      ctime: { $gte: startSec, $lte: endSec }
+      ...validDownlineBuyFilter
     });
     const l3Sum = l3BuyTxs.reduce((sum, t) => sum + (t.amount || 0), 0);
     dividend += l3Sum * 1e-3;
@@ -1114,9 +1119,6 @@ function isToolUsedForOrder(tool, tx) {
   const toolUpi = String(tool.upi || tool.account || "").toLowerCase().trim();
   const txUpi = String(tx.ct_account || tx.payer_upi || tx.ctAccount || tx.selected_upi || tx.payerUpi || "").toLowerCase().trim();
   if (toolUpi && txUpi && (toolUpi === txUpi || txUpi.includes(toolUpi) || toolUpi.includes(txUpi))) return true;
-  const toolCtType = getNormalizedCtType(tool.type !== void 0 ? tool.type : tool.ctType);
-  const txCtType = getNormalizedCtType(tx.ctType !== void 0 ? tx.ctType : tx.ct_type !== void 0 ? tx.ct_type : 1);
-  if (toolCtType === txCtType) return true;
   return false;
 }
 function getAutomationConfig(ct_type) {
@@ -1751,13 +1753,15 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
   }
   try {
     const sessionOpt = useSession && session ? { session } : {};
+    const nowFinishSec = Math.floor(Date.now() / 1e3);
     const claimedTx = await Transaction.findOneAndUpdate(
       queryFilter,
       {
         $set: {
           isBalanceCredited: true,
           payer_status: 3,
-          reward: reward4Pct
+          reward: reward4Pct,
+          finishTime: nowFinishSec
         }
       },
       { new: true, ...sessionOpt }
@@ -1815,6 +1819,16 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
     tx.isBalanceCredited = true;
     tx.reward = reward4Pct;
     tx.payer_status = 3;
+    tx.finishTime = nowFinishSec;
+    tx.fnsDate = nowFinishSec;
+    const cleanRptNoSync = String(claimedTx.rptNo || "").replace(/^SELL_/i, "").trim();
+    if (cleanRptNoSync) {
+      await Transaction.updateMany(
+        { $or: [{ rptNo: `SELL_${cleanRptNoSync}` }, { rptNo: cleanRptNoSync }] },
+        { $set: { finishTime: nowFinishSec, payer_status: 3 } }
+      ).catch(() => {
+      });
+    }
     if (fallbackUser && fallbackUser._id && fallbackUser._id.toString() === updatedBuyer._id.toString()) {
       fallbackUser.balance = updatedBuyer.balance;
       fallbackUser.recharge = updatedBuyer.recharge;
@@ -3192,9 +3206,9 @@ app.get("/xxapi/config", async (req, res) => {
     code: 0,
     msg: "success",
     data: {
-      okTurnstileSitekey: "0",
-      rsKeyMode: 0,
-      siteKey: "0",
+      okTurnstileSitekey: "1x00000000000000000000AA",
+      rsKeyMode: 1,
+      siteKey: "1x00000000000000000000AA",
       sliderSmsCaptcha: 0,
       usdtExchangerate: usdtRate,
       trc20Address: trc20Addr,
@@ -3258,8 +3272,8 @@ app.get("/xxapi/simpConfig", async (req, res) => {
       siteName: "Monexo",
       logo: "favicon.ico",
       customerServiceUrl: "https://t.me/+4F3O2KrkP98yZjk1",
-      okTurnstileSitekey: "0",
-      rsKeyMode: 0,
+      okTurnstileSitekey: "1x00000000000000000000AA",
+      rsKeyMode: 1,
       sliderSmsCaptcha: 0,
       payerTimeoutTime: 600
     }
@@ -3565,8 +3579,8 @@ app.post(["/xxapi/oldRptNew/reward", "/xxapi/inviteNewbieStepTotal/reward"], asy
     amount: rewardAmt,
     reward: 0,
     isBalanceCredited: true,
-    isAdminAddition: true,
-    type: "transfer_in",
+    isAdminAddition: false,
+    type: "reward",
     payer_status: 3,
     reason_for_rejection: `Invite Newbie Reward (${unclaimedCount} friends)`,
     ctime: Math.floor(Date.now() / 1e3),
@@ -3630,7 +3644,7 @@ async function claimNewbieRewardAtomically(user) {
     amount: 200,
     reward: 0,
     isBalanceCredited: true,
-    isAdminAddition: true,
+    isAdminAddition: false,
     type: "reward",
     payer_status: 3,
     reason_for_rejection: "Newbie Reward (\u20B9200)",
@@ -3726,8 +3740,8 @@ app.post(["/xxapi/inviteDayStep/reward/:id", "/xxapi/inviteDayStep/reward"], asy
     amount: 200,
     reward: 0,
     isBalanceCredited: true,
-    isAdminAddition: true,
-    type: "transfer_in",
+    isAdminAddition: false,
+    type: "reward",
     payer_status: 3,
     reason_for_rejection: `Invite Friend Step Reward (${friendKey})`,
     ctime: Math.floor(Date.now() / 1e3),
@@ -4805,11 +4819,16 @@ app.get("/xxapi/buyitoken/paymentslipdetail", async (req, res) => {
       "Order status": currentPayerStatus === 3 ? "Success" : currentPayerStatus === 4 ? "Cancelled" : currentPayerStatus === 1 ? "Paying" : "In Review",
       orderStatus: currentPayerStatus === 3 ? "Success" : currentPayerStatus === 4 ? "Cancelled" : currentPayerStatus === 1 ? "Paying" : "In Review",
       "Finish time": (function() {
+        if (currentPayerStatus !== 3) return "";
+        const dealSec = tx ? tx.dealTime || tx.ctime : Math.floor(Date.now() / 1e3);
         let fnsSec = tx ? tx.finishTime || tx.fnsDate || 0 : 0;
-        if (!fnsSec && currentPayerStatus === 3) {
-          fnsSec = tx ? tx.dealTime || tx.ctime : Math.floor(Date.now() / 1e3);
+        if (!fnsSec || fnsSec <= dealSec) {
+          if (tx && tx.updatedAt && Math.floor(new Date(tx.updatedAt).getTime() / 1e3) > dealSec) {
+            fnsSec = Math.floor(new Date(tx.updatedAt).getTime() / 1e3);
+          } else {
+            fnsSec = dealSec + 180;
+          }
         }
-        if (!fnsSec) return "";
         const d = new Date((fnsSec > 1e10 ? Math.floor(fnsSec / 1e3) : fnsSec) * 1e3);
         return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
       })(),
@@ -5942,11 +5961,12 @@ async function healAndGetCleanTools(user) {
         delete t.savedOriginalState;
         delete t.relinkPending;
         modified = true;
-      } else if (t && t.savedUpi && (!t.upi || t.upi === "Pending verification")) {
+      } else if (t && t.savedUpi && (!t.upi || t.upi === "Pending verification" || t.relinkPending)) {
         t.upi = t.savedUpi;
-        t.state = 2;
-        t.status = 1;
-        delete t.relinkPending;
+        if (t.state === 2 || t.relinkPending) {
+          t.state = 6;
+          t.status = 1;
+        }
         modified = true;
       }
     });
@@ -5957,12 +5977,14 @@ async function healAndGetCleanTools(user) {
   const uniqueToolMap = /* @__PURE__ */ new Map();
   for (const t of rawTools) {
     let partnerType = getNormalizedCtType(t.type !== void 0 ? t.type : t.ctType);
-    if (!uniqueToolMap.has(partnerType)) {
-      uniqueToolMap.set(partnerType, t);
+    const toolAcc = String(t.account || t.phone || t.upi || t.id || "").trim().toLowerCase();
+    const toolKey = `${partnerType}_${toolAcc}`;
+    if (!uniqueToolMap.has(toolKey)) {
+      uniqueToolMap.set(toolKey, t);
     } else {
-      const existing = uniqueToolMap.get(partnerType);
+      const existing = uniqueToolMap.get(toolKey);
       if ((t.verifiedAt || 0) > (existing.verifiedAt || 0)) {
-        uniqueToolMap.set(partnerType, t);
+        uniqueToolMap.set(toolKey, t);
       }
       modified = true;
     }
@@ -5988,33 +6010,40 @@ async function healAndGetCleanTools(user) {
     }
     const activeReviewOrders = await Transaction.find({
       $or: [
-        { userId: user._id },
+        { userId: user._id, type: { $ne: "sell" } },
         { buyerUserId: user._id },
-        { sellerId: user._id },
-        { phone: user.phone },
-        { buyerPhone: user.phone },
-        { sellerPhone: user.phone },
-        { merchant_phone: user.phone }
+        { phone: user.phone, type: { $ne: "sell" } },
+        { buyerPhone: user.phone }
       ].filter(Boolean),
       payer_status: 2
     });
     let resolvedState = t.state !== void 0 && t.state !== null ? Number(t.state) : 2;
     let resolvedStatus = t.status !== void 0 && t.status !== null ? Number(t.status) : 1;
-    const isPaytm = isPaytmTool(typeVal, t.pnname || t.name, t.upi || t.account);
-    const isUnlinkedByReview = activeReviewOrders.some((order) => !isPaytm && isToolUsedForOrder(t, order));
-    if (isUnlinkedByReview) {
-      resolvedState = 5;
-      resolvedStatus = 0;
-    } else {
-      if (isPaytm) {
-        if (resolvedState !== 7) {
-          resolvedState = 2;
-          resolvedStatus = 1;
-        }
+    if (t.relinkPending || t.state === 5 || t.state === 7 || t.state === 6) {
+      if (t.state === 6 || t.relinkPending) {
+        resolvedState = 6;
+        resolvedStatus = 1;
       } else {
-        if (resolvedState === 5 || resolvedStatus === 0) {
-          resolvedState = 5;
-          resolvedStatus = 0;
+        resolvedState = 5;
+        resolvedStatus = 0;
+      }
+    } else {
+      const isPaytm2 = isPaytmTool(typeVal, t.pnname || t.name, t.upi || t.account);
+      const isUnlinkedByReview2 = activeReviewOrders.some((order) => !isPaytm2 && isToolUsedForOrder(t, order));
+      if (isUnlinkedByReview2) {
+        resolvedState = 5;
+        resolvedStatus = 0;
+      } else {
+        if (isPaytm2) {
+          if (resolvedState !== 7 && resolvedState !== 5 && resolvedState !== 6) {
+            resolvedState = 2;
+            resolvedStatus = 1;
+          }
+        } else {
+          if (resolvedState === 5 || resolvedStatus === 0) {
+            resolvedState = 5;
+            resolvedStatus = 0;
+          }
         }
       }
     }
@@ -6182,8 +6211,8 @@ app.post("/xxapi/collectiontool", async (req, res) => {
     user.collectionTools = [];
   }
   let tool = user.collectionTools.find((t) => t && (t.id === id || t._id === id || String(t.id) === String(id)));
-  if (!tool) {
-    tool = user.collectionTools.slice().reverse().find((t) => t && (t.relinkPending || t.state === 7 || t.state === 5 || t.upi === "Pending verification" || !t.upi));
+  if (!tool && account) {
+    tool = user.collectionTools.find((t) => t && (t.account === account || t.phone === account));
   }
   if (!tool) {
     tool = {
@@ -6484,8 +6513,8 @@ app.post("/xxapi/collectiontool/startsell", async (req, res) => {
     ].filter(Boolean),
     payer_status: 2
   });
-  const isPaytm = tool ? isPaytmTool(tool.type || tool.ctType, tool.pnname || tool.name, tool.upi || tool.account) : false;
-  const isBlockedByReview = activeReviewOrders.some((order) => !isPaytm && isToolUsedForOrder(tool, order));
+  const isPaytm2 = tool ? isPaytmTool(tool.type || tool.ctType, tool.pnname || tool.name, tool.upi || tool.account) : false;
+  const isBlockedByReview = activeReviewOrders.some((order) => !isPaytm2 && isToolUsedForOrder(tool, order));
   if (isBlockedByReview) {
     return res.json({ code: 400, msg: "Order using this method is currently in review/interview. Relinking disabled during review." });
   }
@@ -7026,26 +7055,24 @@ async function handleOrderEnteredInReview(tx) {
   try {
     if (!tx || tx.payer_status !== 2) return;
     const userQuery = [
-      tx.userId ? { _id: tx.userId } : null,
       tx.buyerUserId ? { _id: tx.buyerUserId } : null,
-      tx.sellerId ? { _id: tx.sellerId } : null,
-      tx.phone ? { phone: tx.phone } : null,
+      tx.userId && tx.type !== "sell" ? { _id: tx.userId } : null,
       tx.buyerPhone ? { phone: tx.buyerPhone } : null,
-      tx.sellerPhone ? { phone: tx.sellerPhone } : null,
-      tx.merchant_phone ? { phone: tx.merchant_phone } : null,
-      tx.payee_bank_account ? { "collectionTools.upi": tx.payee_bank_account } : null,
-      tx.payee_bank_account ? { "collectionTools.account": tx.payee_bank_account } : null,
-      tx.receiverUpi ? { "collectionTools.upi": tx.receiverUpi } : null
+      tx.phone && tx.type !== "sell" ? { phone: tx.phone } : null,
+      tx.payer_upi ? { "collectionTools.upi": tx.payer_upi } : null,
+      tx.ct_account ? { "collectionTools.account": tx.ct_account } : null
     ].filter(Boolean);
     const users = userQuery.length > 0 ? await User.find({ $or: userQuery }) : [];
     for (const user of users) {
+      const isSeller = tx.sellerId && String(tx.sellerId) === String(user._id) || tx.sellerPhone && (tx.sellerPhone === user.phone || tx.sellerPhone === user.mobileNo);
+      if (isSeller) continue;
       if (user && user.collectionTools && Array.isArray(user.collectionTools)) {
         let modified = false;
         user.collectionTools.forEach((tool) => {
           if (!tool) return;
-          const isPaytm = isPaytmTool(tool.type || tool.ctType, tool.pnname || tool.name, tool.upi || tool.account);
+          const isPaytm2 = isPaytmTool(tool.type || tool.ctType, tool.pnname || tool.name, tool.upi || tool.account);
           const isUsedForTx = isToolUsedForOrder(tool, tx);
-          if (isUsedForTx && !isPaytm) {
+          if (isUsedForTx && !isPaytm2) {
             if (tool.status !== 0 || tool.inSell !== 0 || tool.state !== 5) {
               tool.status = 0;
               tool.inSell = 0;
@@ -7348,11 +7375,9 @@ app.post("/xxapi/monitorflow/three", async (req, res) => {
         } else {
           if (tool.savedUpi) tool.upi = tool.savedUpi;
           if (tool.savedBackupUpi) tool.backup_upi = tool.savedBackupUpi;
-          if (tool.upi && tool.upi !== "Pending verification" && tool.upi.includes("@")) {
-            tool.state = 2;
-            tool.status = 1;
-            tool.inSell = 1;
-          }
+          tool.state = 6;
+          tool.status = 1;
+          tool.inSell = 0;
         }
         user.markModified("collectionTools");
         await user.save().catch(() => {
@@ -7387,11 +7412,9 @@ app.post("/xxapi/monitorflow/three", async (req, res) => {
         } else {
           if (tool.savedUpi) tool.upi = tool.savedUpi;
           if (tool.savedBackupUpi) tool.backup_upi = tool.savedBackupUpi;
-          if (tool.upi && tool.upi !== "Pending verification" && tool.upi.includes("@")) {
-            tool.state = 2;
-            tool.status = 1;
-            tool.inSell = 1;
-          }
+          tool.state = 6;
+          tool.status = 1;
+          tool.inSell = 0;
         }
         user.markModified("collectionTools");
         await user.save().catch(() => {
@@ -8012,9 +8035,13 @@ async function getRechargeHistory(req, res) {
     }
     const debitTimeSec = tx.ctime || Math.floor(Date.now() / 1e3);
     const dealTimeSec = tx.dealTime || tx.utime || (tx.payer_status >= 2 ? tx.updatedAt ? Math.floor(new Date(tx.updatedAt).getTime() / 1e3) : debitTimeSec : debitTimeSec);
-    let finishTimeSec = tx.finishTime || tx.fnsDate || (tx.payer_status >= 3 ? tx.updatedAt ? Math.floor(new Date(tx.updatedAt).getTime() / 1e3) : dealTimeSec : 0);
-    if ((tx.payer_status === 3 || orderState === 3) && !finishTimeSec) {
-      finishTimeSec = dealTimeSec || debitTimeSec;
+    let finishTimeSec = tx.finishTime || tx.fnsDate || 0;
+    if ((tx.payer_status === 3 || orderState === 3) && (!finishTimeSec || finishTimeSec <= dealTimeSec)) {
+      if (tx.updatedAt && Math.floor(new Date(tx.updatedAt).getTime() / 1e3) > dealTimeSec) {
+        finishTimeSec = Math.floor(new Date(tx.updatedAt).getTime() / 1e3);
+      } else {
+        finishTimeSec = dealTimeSec + 180;
+      }
     }
     const formatTsString = (sec) => {
       if (!sec || sec <= 0) return "";
@@ -8029,10 +8056,7 @@ async function getRechargeHistory(req, res) {
     };
     const debitTimeStr = formatTsString(debitTimeSec);
     const dealTimeStr = formatTsString(dealTimeSec);
-    let finishTimeStr = formatTsString(finishTimeSec);
-    if ((tx.payer_status === 3 || orderState === 3) && (!finishTimeStr || finishTimeStr === "")) {
-      finishTimeStr = dealTimeStr || debitTimeStr;
-    }
+    const finishTimeStr = tx.payer_status === 3 || orderState === 3 ? formatTsString(finishTimeSec) : "";
     const isUsdtTx = tx.isUsdt === true || String(tx.rptNo || "").startsWith("USDT");
     let effectiveAmount = Number(tx.amount || 0);
     if (isUsdtTx) {
@@ -8230,11 +8254,15 @@ async function getTransferTokenHistory(req, res) {
         },
         {
           $or: [
-            { isAdminAddition: true },
             { type: "admin" },
             { rptNo: { $regex: /^ADM/i } },
-            { reason_for_rejection: { $regex: /admin/i } }
+            { reason_for_rejection: { $regex: /Admin Balance|Admin Money/i } }
           ]
+        },
+        {
+          rptNo: { $not: /^(NWB|INV)/i },
+          type: { $ne: "reward" },
+          reason_for_rejection: { $not: /Newbie|Invite|Bonus|Step Reward/i }
         }
       ]
     };
@@ -8459,7 +8487,14 @@ async function getSellHistory(req, res) {
       const isUpi = tx.payment_method === 1 || String(tx.payee_bankname || "").toLowerCase().includes("upi") || !tx.payee_ifsc;
       const debitTimeSec = tx.ctime || Math.floor(Date.now() / 1e3);
       const dealTimeSec = tx.dealTime || tx.utime || (effectivePayerStatus >= 2 ? tx.updatedAt ? Math.floor(new Date(tx.updatedAt).getTime() / 1e3) : debitTimeSec : debitTimeSec);
-      const finishTimeSec = tx.finishTime || tx.fnsDate || (effectivePayerStatus >= 3 ? tx.updatedAt ? Math.floor(new Date(tx.updatedAt).getTime() / 1e3) : debitTimeSec : 0);
+      let finishTimeSec = tx.finishTime || tx.fnsDate || 0;
+      if (effectivePayerStatus === 3 && (!finishTimeSec || finishTimeSec <= dealTimeSec)) {
+        if (tx.updatedAt && Math.floor(new Date(tx.updatedAt).getTime() / 1e3) > dealTimeSec) {
+          finishTimeSec = Math.floor(new Date(tx.updatedAt).getTime() / 1e3);
+        } else {
+          finishTimeSec = dealTimeSec + 180;
+        }
+      }
       const formatTs = (sec) => {
         if (!sec) return "";
         const d = new Date(sec * 1e3);
@@ -8473,10 +8508,7 @@ async function getSellHistory(req, res) {
       };
       const debitTimeStr = formatTs(debitTimeSec);
       const dealTimeStr = formatTs(dealTimeSec);
-      let finishTimeStr = formatTs(finishTimeSec);
-      if (effectivePayerStatus === 3 && !finishTimeStr) {
-        finishTimeStr = dealTimeStr || debitTimeStr;
-      }
+      const finishTimeStr = effectivePayerStatus === 3 ? formatTs(finishTimeSec) : "";
       const sellerReceiveUpi = tx.payee_bank_account || tx.upi || "";
       const userPayerStatus = effectivePayerStatus === 4 || effectivePayerStatus === 5 ? 5 : effectivePayerStatus;
       const realUtr = tx.utr || tx.ref_no || "";
@@ -8637,6 +8669,29 @@ async function handleSellDetail(req, res) {
     }
     const cancelReason = tx.cancelRemark || tx.cancel_remark || tx.rejectionReason || tx.reason || tx.adminReason || "Order timed out / cancelled";
     const debitTimeSec = tx.ctime || Math.floor(Date.now() / 1e3);
+    const dealTimeSec = tx.dealTime || tx.utime || debitTimeSec;
+    let finishTimeSec = tx.finishTime || tx.fnsDate || 0;
+    if (effectiveStatus === 3 && (!finishTimeSec || finishTimeSec <= dealTimeSec)) {
+      if (tx.updatedAt && Math.floor(new Date(tx.updatedAt).getTime() / 1e3) > dealTimeSec) {
+        finishTimeSec = Math.floor(new Date(tx.updatedAt).getTime() / 1e3);
+      } else {
+        finishTimeSec = dealTimeSec + 180;
+      }
+    }
+    const formatTs = (sec) => {
+      if (!sec) return "";
+      const d = new Date(sec * 1e3);
+      const YYYY = d.getFullYear();
+      const MM = String(d.getMonth() + 1).padStart(2, "0");
+      const DD = String(d.getDate()).padStart(2, "0");
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      const ss = String(d.getSeconds()).padStart(2, "0");
+      return `${YYYY}-${MM}-${DD} ${hh}:${mm}:${ss}`;
+    };
+    const debitTimeStr = formatTs(debitTimeSec);
+    const dealTimeStr = formatTs(dealTimeSec);
+    const finishTimeStr = effectiveStatus === 3 ? formatTs(finishTimeSec) : "";
     const userPayerStatus = effectiveStatus === 4 || effectiveStatus === 5 ? 5 : effectiveStatus;
     const orderState = effectiveStatus === 3 ? 3 : effectiveStatus === 4 || effectiveStatus === 5 ? 5 : effectiveStatus === 1 ? 1 : 2;
     return res.json({
@@ -8672,7 +8727,17 @@ async function handleSellDetail(req, res) {
         upi: tx.payee_bank_account || tx.upi || "",
         payee_recipients_name: tx.payee_recipients_name || "Merchant Partner",
         pnname: tx.payee_recipients_name || "Merchant Partner",
+        "Deal time": dealTimeStr,
+        dealTime: dealTimeStr,
+        deal_time: dealTimeStr,
+        "Finish time": finishTimeStr,
+        finishTime: finishTimeStr,
+        finish_time: finishTimeStr,
+        debitTime: debitTimeStr,
+        debit_time: debitTimeStr,
         crtDate: debitTimeSec * 1e3,
+        uptDate: dealTimeSec * 1e3,
+        fnsDate: finishTimeSec ? finishTimeSec * 1e3 : 0,
         showDetail: true,
         canDetail: true
       }
@@ -9558,9 +9623,9 @@ app.get("/xxapi/admin/userDetail", requireAdmin, async (req, res) => {
     });
     const enrichedCollectionTools = await Promise.all(rawTools.map(async (tool) => {
       const toolObj = { ...tool };
-      const isPaytm = isPaytmTool(toolObj.type || toolObj.ctType, toolObj.pnname || toolObj.name, toolObj.upi || toolObj.account);
-      const isUnlinkedByReview = activeReviewOrders.some((order) => !isPaytm && isToolUsedForOrder(toolObj, order));
-      if (isUnlinkedByReview) {
+      const isPaytm2 = isPaytmTool(toolObj.type || toolObj.ctType, toolObj.pnname || toolObj.name, toolObj.upi || toolObj.account);
+      const isUnlinkedByReview2 = activeReviewOrders.some((order) => !isPaytm2 && isToolUsedForOrder(toolObj, order));
+      if (isUnlinkedByReview2) {
         toolObj.state = 5;
         toolObj.status = 0;
         toolObj.inSell = 0;
@@ -11743,9 +11808,9 @@ app.get(["/rsCfg.json", "/public/rsCfg.json"], (req, res) => {
     code: 0,
     msg: "success",
     data: {
-      okTurnstileSitekey: "0",
-      rsKeyMode: 0,
-      siteKey: "0",
+      okTurnstileSitekey: "1x00000000000000000000AA",
+      rsKeyMode: 1,
+      siteKey: "1x00000000000000000000AA",
       antResetPassFlag: "0",
       sliderSmsCaptcha: 0,
       appDownloadUrl: "https://gtpbhzhildmyyzfwrmeu.supabase.co/storage/v1/object/sign/Monexo/monexopay.apk?token=eyJraWQiOiI4MmU5MWRjOC03Mzg4LTQ2ZDktYjM2Ni1iNzE0MmUxYWYzMTYiLCJhbGciOiJIUzUxMiJ9.eyJ1cmwiOiJNb25leG8vbW9uZXhvcGF5LmFwayIsInNjb3BlIjoiZG93bmxvYWQiLCJpYXQiOjE3OTAwODEyODEsImV4cCI6MTgyMTYxNzI4MX0.EyZ0IxbriFgIXLRAqAVPTv-cNu5RBOcYGCswDgU9-lplTRIYGt0MM1sfvKEmhXzQMr0T1Qs4YNpRV68kvNGbcw",
@@ -11846,8 +11911,8 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env
         for (let i = 0; i < user.collectionTools.length; i++) {
           const tool = user.collectionTools[i];
           if (tool) {
-            const isPaytm = isPaytmTool(tool.type || tool.ctType, tool.pnname || tool.name, tool.upi || tool.account);
-            if (hasActiveReviewOrder && !isPaytm) {
+            const isPaytm2 = isPaytmTool(tool.type || tool.ctType, tool.pnname || tool.name, tool.upi || tool.account);
+            if (hasActiveReviewOrder && !isPaytm2) {
               if (tool.status !== 0 || tool.state !== 5 || tool.inSell !== 0) {
                 tool.status = 0;
                 tool.state = 5;
@@ -11855,7 +11920,7 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env
                 userUpdated = true;
                 console.log(`[P2P Sweeper In-Review] Unlinked non-Paytm tool (${tool.upi || tool.account}) for user ${user.phone}`);
               }
-            } else if (hasActiveReviewOrder && isPaytm) {
+            } else if (hasActiveReviewOrder && isPaytm2) {
               if (tool.state !== 7) {
                 if (tool.status !== 1 || tool.state !== 2 || tool.inSell !== 1) {
                   tool.status = 1;
@@ -11881,7 +11946,7 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env
                   method: "POST",
                   body: JSON.stringify({
                     id: tool.zoopayToolId,
-                    state: hasActiveReviewOrder && !isPaytm ? "disabled" : "enabled"
+                    state: hasActiveReviewOrder && !isPaytm2 ? "disabled" : "enabled"
                   })
                 });
               } catch (err) {
