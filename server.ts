@@ -7014,6 +7014,23 @@ async function healAndGetCleanTools(user) {
   }
 
   const cleanTools: any[] = [];
+  let activeReviewOrders: any[] = [];
+  if (deduplicatedTools.length > 0) {
+    try {
+      // STRICT RULE: ONLY check review orders where this user is the BUYER! NEVER unlink seller tools!
+      activeReviewOrders = await Transaction.find({
+        $or: [
+          { userId: user._id, type: { $ne: 'sell' } },
+          { buyerUserId: user._id },
+          { phone: user.phone, type: { $ne: 'sell' } },
+          { buyerPhone: user.phone }
+        ].filter(Boolean),
+        payer_status: 2
+      });
+    } catch (err) {
+      activeReviewOrders = [];
+    }
+  }
   
   for (const t of deduplicatedTools) {
     let typeVal = getNormalizedCtType(t.type !== undefined ? t.type : t.ctType);
@@ -7031,19 +7048,11 @@ async function healAndGetCleanTools(user) {
       modified = true;
     }
 
-    // STRICT RULE: ONLY check review orders where this user is the BUYER! NEVER unlink seller tools!
-    const activeReviewOrders = await Transaction.find({
-      $or: [
-        { userId: user._id, type: { $ne: 'sell' } },
-        { buyerUserId: user._id },
-        { phone: user.phone, type: { $ne: 'sell' } },
-        { buyerPhone: user.phone }
-      ].filter(Boolean),
-      payer_status: 2
-    });
-
     let resolvedState = (t.state !== undefined && t.state !== null) ? Number(t.state) : 2;
     let resolvedStatus = (t.status !== undefined && t.status !== null) ? Number(t.status) : 1;
+
+    const isPaytm = isPaytmTool(typeVal, t.pnname || t.name, t.upi || t.account);
+    const isUnlinkedByReview = activeReviewOrders.some(order => !isPaytm && isToolUsedForOrder(t, order));
 
     // If tool is unlinked or relink pending without verified OTP, maintain waiting online (6) or unlink (5)
     if (t.relinkPending || t.state === 5 || t.state === 7 || t.state === 6) {
@@ -7055,9 +7064,6 @@ async function healAndGetCleanTools(user) {
         resolvedStatus = 0;
       }
     } else {
-      const isPaytm = isPaytmTool(typeVal, t.pnname || t.name, t.upi || t.account);
-      const isUnlinkedByReview = activeReviewOrders.some(order => !isPaytm && isToolUsedForOrder(t, order));
-
       if (isUnlinkedByReview) {
         // ONLY unlinks if this specific tool was used in an active buyer review order
         resolvedState = 5;
@@ -7160,10 +7166,15 @@ async function healAndGetCleanTools(user) {
 }
 
 app.get('/xxapi/collectiontoollist', async (req, res) => {
-  const user = await getUserByToken(req);
-  if (!user) return res.json({ code: 403, msg: 'Unauthorized' });
-  const cleanTools = await healAndGetCleanTools(user);
-  return res.json({ code: 0, msg: 'success', data: cleanTools });
+  try {
+    const user = await getUserByToken(req);
+    if (!user) return res.json({ code: 403, msg: 'Unauthorized' });
+    const cleanTools = await healAndGetCleanTools(user);
+    return res.json({ code: 0, msg: 'success', data: cleanTools });
+  } catch (err) {
+    console.error('[/xxapi/collectiontoollist Error]', err);
+    return res.json({ code: 0, msg: 'success', data: [] });
+  }
 });
 
 app.get('/xxapi/collectiontool', async (req, res) => {

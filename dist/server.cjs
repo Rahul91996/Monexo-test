@@ -5995,6 +5995,22 @@ async function healAndGetCleanTools(user) {
     modified = true;
   }
   const cleanTools = [];
+  let activeReviewOrders = [];
+  if (deduplicatedTools.length > 0) {
+    try {
+      activeReviewOrders = await Transaction.find({
+        $or: [
+          { userId: user._id, type: { $ne: "sell" } },
+          { buyerUserId: user._id },
+          { phone: user.phone, type: { $ne: "sell" } },
+          { buyerPhone: user.phone }
+        ].filter(Boolean),
+        payer_status: 2
+      });
+    } catch (err) {
+      activeReviewOrders = [];
+    }
+  }
   for (const t of deduplicatedTools) {
     let typeVal = getNormalizedCtType(t.type !== void 0 ? t.type : t.ctType);
     if (!t.upi || t.upi === "Pending verification") {
@@ -6008,17 +6024,10 @@ async function healAndGetCleanTools(user) {
       t.id = toolIdVal;
       modified = true;
     }
-    const activeReviewOrders = await Transaction.find({
-      $or: [
-        { userId: user._id, type: { $ne: "sell" } },
-        { buyerUserId: user._id },
-        { phone: user.phone, type: { $ne: "sell" } },
-        { buyerPhone: user.phone }
-      ].filter(Boolean),
-      payer_status: 2
-    });
     let resolvedState = t.state !== void 0 && t.state !== null ? Number(t.state) : 2;
     let resolvedStatus = t.status !== void 0 && t.status !== null ? Number(t.status) : 1;
+    const isPaytm = isPaytmTool(typeVal, t.pnname || t.name, t.upi || t.account);
+    const isUnlinkedByReview = activeReviewOrders.some((order) => !isPaytm && isToolUsedForOrder(t, order));
     if (t.relinkPending || t.state === 5 || t.state === 7 || t.state === 6) {
       if (t.state === 6 || t.relinkPending) {
         resolvedState = 6;
@@ -6028,13 +6037,11 @@ async function healAndGetCleanTools(user) {
         resolvedStatus = 0;
       }
     } else {
-      const isPaytm2 = isPaytmTool(typeVal, t.pnname || t.name, t.upi || t.account);
-      const isUnlinkedByReview2 = activeReviewOrders.some((order) => !isPaytm2 && isToolUsedForOrder(t, order));
-      if (isUnlinkedByReview2) {
+      if (isUnlinkedByReview) {
         resolvedState = 5;
         resolvedStatus = 0;
       } else {
-        if (isPaytm2) {
+        if (isPaytm) {
           if (resolvedState !== 7 && resolvedState !== 5 && resolvedState !== 6) {
             resolvedState = 2;
             resolvedStatus = 1;
@@ -6114,10 +6121,15 @@ async function healAndGetCleanTools(user) {
   return cleanTools;
 }
 app.get("/xxapi/collectiontoollist", async (req, res) => {
-  const user = await getUserByToken(req);
-  if (!user) return res.json({ code: 403, msg: "Unauthorized" });
-  const cleanTools = await healAndGetCleanTools(user);
-  return res.json({ code: 0, msg: "success", data: cleanTools });
+  try {
+    const user = await getUserByToken(req);
+    if (!user) return res.json({ code: 403, msg: "Unauthorized" });
+    const cleanTools = await healAndGetCleanTools(user);
+    return res.json({ code: 0, msg: "success", data: cleanTools });
+  } catch (err) {
+    console.error("[/xxapi/collectiontoollist Error]", err);
+    return res.json({ code: 0, msg: "success", data: [] });
+  }
 });
 app.get("/xxapi/collectiontool", async (req, res) => {
   const user = await getUserByToken(req);
@@ -6513,8 +6525,8 @@ app.post("/xxapi/collectiontool/startsell", async (req, res) => {
     ].filter(Boolean),
     payer_status: 2
   });
-  const isPaytm2 = tool ? isPaytmTool(tool.type || tool.ctType, tool.pnname || tool.name, tool.upi || tool.account) : false;
-  const isBlockedByReview = activeReviewOrders.some((order) => !isPaytm2 && isToolUsedForOrder(tool, order));
+  const isPaytm = tool ? isPaytmTool(tool.type || tool.ctType, tool.pnname || tool.name, tool.upi || tool.account) : false;
+  const isBlockedByReview = activeReviewOrders.some((order) => !isPaytm && isToolUsedForOrder(tool, order));
   if (isBlockedByReview) {
     return res.json({ code: 400, msg: "Order using this method is currently in review/interview. Relinking disabled during review." });
   }
@@ -7070,9 +7082,9 @@ async function handleOrderEnteredInReview(tx) {
         let modified = false;
         user.collectionTools.forEach((tool) => {
           if (!tool) return;
-          const isPaytm2 = isPaytmTool(tool.type || tool.ctType, tool.pnname || tool.name, tool.upi || tool.account);
+          const isPaytm = isPaytmTool(tool.type || tool.ctType, tool.pnname || tool.name, tool.upi || tool.account);
           const isUsedForTx = isToolUsedForOrder(tool, tx);
-          if (isUsedForTx && !isPaytm2) {
+          if (isUsedForTx && !isPaytm) {
             if (tool.status !== 0 || tool.inSell !== 0 || tool.state !== 5) {
               tool.status = 0;
               tool.inSell = 0;
@@ -9623,9 +9635,9 @@ app.get("/xxapi/admin/userDetail", requireAdmin, async (req, res) => {
     });
     const enrichedCollectionTools = await Promise.all(rawTools.map(async (tool) => {
       const toolObj = { ...tool };
-      const isPaytm2 = isPaytmTool(toolObj.type || toolObj.ctType, toolObj.pnname || toolObj.name, toolObj.upi || toolObj.account);
-      const isUnlinkedByReview2 = activeReviewOrders.some((order) => !isPaytm2 && isToolUsedForOrder(toolObj, order));
-      if (isUnlinkedByReview2) {
+      const isPaytm = isPaytmTool(toolObj.type || toolObj.ctType, toolObj.pnname || toolObj.name, toolObj.upi || toolObj.account);
+      const isUnlinkedByReview = activeReviewOrders.some((order) => !isPaytm && isToolUsedForOrder(toolObj, order));
+      if (isUnlinkedByReview) {
         toolObj.state = 5;
         toolObj.status = 0;
         toolObj.inSell = 0;
@@ -11911,8 +11923,8 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env
         for (let i = 0; i < user.collectionTools.length; i++) {
           const tool = user.collectionTools[i];
           if (tool) {
-            const isPaytm2 = isPaytmTool(tool.type || tool.ctType, tool.pnname || tool.name, tool.upi || tool.account);
-            if (hasActiveReviewOrder && !isPaytm2) {
+            const isPaytm = isPaytmTool(tool.type || tool.ctType, tool.pnname || tool.name, tool.upi || tool.account);
+            if (hasActiveReviewOrder && !isPaytm) {
               if (tool.status !== 0 || tool.state !== 5 || tool.inSell !== 0) {
                 tool.status = 0;
                 tool.state = 5;
@@ -11920,7 +11932,7 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env
                 userUpdated = true;
                 console.log(`[P2P Sweeper In-Review] Unlinked non-Paytm tool (${tool.upi || tool.account}) for user ${user.phone}`);
               }
-            } else if (hasActiveReviewOrder && isPaytm2) {
+            } else if (hasActiveReviewOrder && isPaytm) {
               if (tool.state !== 7) {
                 if (tool.status !== 1 || tool.state !== 2 || tool.inSell !== 1) {
                   tool.status = 1;
@@ -11946,7 +11958,7 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env
                   method: "POST",
                   body: JSON.stringify({
                     id: tool.zoopayToolId,
-                    state: hasActiveReviewOrder && !isPaytm2 ? "disabled" : "enabled"
+                    state: hasActiveReviewOrder && !isPaytm ? "disabled" : "enabled"
                   })
                 });
               } catch (err) {
