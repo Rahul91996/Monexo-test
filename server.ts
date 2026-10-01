@@ -5342,49 +5342,6 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
       });
     }
 
-    // GUARANTEED FALLBACK ORDERS: If list is empty, generate standard active system orders so the Buy page NEVER shows endless loading
-    if (filteredList.length === 0) {
-      const fallbackAmounts = [100, 200, 300, 500, 1000, 2000, 5000];
-      const targetAmounts = (reqAmtParam && reqAmtParam >= 100) ? [reqAmtParam] : fallbackAmounts;
-      targetAmounts.forEach((amt) => {
-        if (minAmt !== undefined && amt < minAmt) return;
-        if (maxAmt !== undefined && amt > maxAmt) return;
-        const rptNo = generate15DigitRptNo();
-        const fallbackUpi = "merchant@paytm";
-        const partnerName = "Official Merchant Partner";
-        const slipItem: OrderSlipItem = {
-          rptNo,
-          amount: amt,
-          method: 1,
-          ctType: 1,
-          upi: fallbackUpi,
-          pnname: partnerName,
-          ctime: Math.floor(Date.now() / 1000)
-        };
-        (slipItem as any).isAdminNode = true; // Mark as admin node so pickup succeeds smoothly
-        orderSlipMap.set(rptNo, slipItem);
-        filteredList.push({
-          rptNo,
-          amount: amt.toString(),
-          method: 1,
-          payment_method: 1,
-          upi: fallbackUpi,
-          account: fallbackUpi,
-          ctAccount: fallbackUpi,
-          pnaccount: fallbackUpi,
-          accountNumber: fallbackUpi,
-          payAccount: fallbackUpi,
-          acctNo: fallbackUpi,
-          pnname: partnerName,
-          name: partnerName,
-          account_name: partnerName,
-          ctType: 1,
-          ct_type: 1,
-          isAdminNode: true
-        });
-      });
-    }
-
     const ifAsc = req.query.if_asc !== undefined ? (req.query.if_asc === 'true' || req.query.if_asc === '1' || req.query.if_asc === true) : true;
     if (ifAsc) {
       filteredList.sort((a, b) => Number(a.amount) - Number(b.amount));
@@ -5429,19 +5386,8 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
       code: 0,
       msg: 'success',
       data: {
-        total: 1,
-        list: [{
-          rptNo: generate15DigitRptNo(),
-          amount: "500",
-          method: 1,
-          payment_method: 1,
-          upi: "merchant@paytm",
-          pnname: "Official Merchant Partner",
-          ctType: 1,
-          ct_type: 1,
-          ctName: "PhonePe",
-          isAdminNode: true
-        }]
+        total: 0,
+        list: []
       }
     });
   }

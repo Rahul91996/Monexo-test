@@ -4487,47 +4487,6 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
         return amt >= lower && amt <= upper;
       });
     }
-    if (filteredList.length === 0) {
-      const fallbackAmounts = [100, 200, 300, 500, 1e3, 2e3, 5e3];
-      const targetAmounts = reqAmtParam && reqAmtParam >= 100 ? [reqAmtParam] : fallbackAmounts;
-      targetAmounts.forEach((amt) => {
-        if (minAmt !== void 0 && amt < minAmt) return;
-        if (maxAmt !== void 0 && amt > maxAmt) return;
-        const rptNo = generate15DigitRptNo();
-        const fallbackUpi = "merchant@paytm";
-        const partnerName = "Official Merchant Partner";
-        const slipItem = {
-          rptNo,
-          amount: amt,
-          method: 1,
-          ctType: 1,
-          upi: fallbackUpi,
-          pnname: partnerName,
-          ctime: Math.floor(Date.now() / 1e3)
-        };
-        slipItem.isAdminNode = true;
-        orderSlipMap.set(rptNo, slipItem);
-        filteredList.push({
-          rptNo,
-          amount: amt.toString(),
-          method: 1,
-          payment_method: 1,
-          upi: fallbackUpi,
-          account: fallbackUpi,
-          ctAccount: fallbackUpi,
-          pnaccount: fallbackUpi,
-          accountNumber: fallbackUpi,
-          payAccount: fallbackUpi,
-          acctNo: fallbackUpi,
-          pnname: partnerName,
-          name: partnerName,
-          account_name: partnerName,
-          ctType: 1,
-          ct_type: 1,
-          isAdminNode: true
-        });
-      });
-    }
     const ifAsc = req.query.if_asc !== void 0 ? req.query.if_asc === "true" || req.query.if_asc === "1" || req.query.if_asc === true : true;
     if (ifAsc) {
       filteredList.sort((a, b) => Number(a.amount) - Number(b.amount));
@@ -4568,19 +4527,8 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
       code: 0,
       msg: "success",
       data: {
-        total: 1,
-        list: [{
-          rptNo: generate15DigitRptNo(),
-          amount: "500",
-          method: 1,
-          payment_method: 1,
-          upi: "merchant@paytm",
-          pnname: "Official Merchant Partner",
-          ctType: 1,
-          ct_type: 1,
-          ctName: "PhonePe",
-          isAdminNode: true
-        }]
+        total: 0,
+        list: []
       }
     });
   }
