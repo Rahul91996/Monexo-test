@@ -953,7 +953,7 @@
                   <tbody class="bg-white divide-y divide-slate-100">
                     <tr v-for="node in nodeHistory" :key="node._id" class="hover:bg-slate-50/50 transition">
                       <td class="px-5 py-4 font-mono font-bold text-xs text-slate-700">
-                        {{ node.claimedRptNo || node._id }}
+                        {{ node.claimedRptNo || node.rptNo }}
                       </td>
                       <td class="px-5 py-4">
                         <span class="block font-bold text-slate-800">{{ node.name }}</span>

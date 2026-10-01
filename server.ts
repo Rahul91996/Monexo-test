@@ -12869,6 +12869,7 @@ app.get('/xxapi/admin/nodes', requireAdmin, async (req, res) => {
 
       return {
         ...n,
+        rptNo: getAdminNode15DigitRptNo(n),
         orderState: state,
         claimedByPhone: buyerPhone,
         remainingSeconds,
@@ -12905,7 +12906,7 @@ app.get('/xxapi/admin/nodeHistory', requireAdmin, async (req: any, res: any) => 
       let txUtr = n.utr || '';
       let state = n.orderState || 'ACTIVE';
 
-      if (n.claimedRptNo) {
+      if (n.claimedRptNo && buyerPhone) {
         const tx = txMap.get(n.claimedRptNo);
         if (tx) {
           if (tx.utr) txUtr = tx.utr;
@@ -12920,8 +12921,8 @@ app.get('/xxapi/admin/nodeHistory', requireAdmin, async (req: any, res: any) => 
         }
       }
 
-      // If no buyer phone and no claimed RPT, order is NOT claimed and NOT completed -> FORCE 'ACTIVE'
-      if (!n.claimedRptNo && !buyerPhone) {
+      // If no buyer phone, order is NOT claimed and NOT completed -> FORCE 'ACTIVE'
+      if (!buyerPhone) {
         state = 'ACTIVE';
       }
 
@@ -12933,6 +12934,7 @@ app.get('/xxapi/admin/nodeHistory', requireAdmin, async (req: any, res: any) => 
 
       return {
         ...n,
+        rptNo: getAdminNode15DigitRptNo(n),
         orderState: state,
         claimedByPhone: buyerPhone,
         remainingSeconds,
