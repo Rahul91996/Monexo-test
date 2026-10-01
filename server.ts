@@ -5116,7 +5116,15 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
 
     // 1. Fetch DB data reliably
     const [candidateAdminNodes, sellingUsers, allPendingTxs, sellerDelays] = await Promise.all([
-      PaymentNode.find({ status: true }).sort({ createdAt: -1 }).lean(),
+      PaymentNode.find({
+        status: true,
+        $or: [
+          { orderState: 'ACTIVE' },
+          { orderState: { $exists: false } },
+          { orderState: null },
+          { orderState: '' }
+        ]
+      }).sort({ createdAt: -1 }).lean(),
       User.find({ balance: { $gte: 100 }, status: { $nin: ['disabled', 'suspended'] } }).lean(),
       Transaction.find({ payer_status: { $in: [1, 2] } }).lean(),
       SellerDelay.find({ unfreezeTime: { $gt: new Date() } }).lean()
@@ -5142,9 +5150,11 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
       if (sd.sellerPhone) frozenSellers.add(sd.sellerPhone.toString());
     }
 
-    // Process Admin Nodes
+    // Process Admin Nodes (Only show ACTIVE non-claimed nodes)
     for (const node of candidateAdminNodes) {
       if (!node) continue;
+      if (node.orderState && node.orderState !== 'ACTIVE') continue; // Do NOT show CLAIMED, COMPLETED, CANCELLED, or EXPIRED orders
+
       const nodeIdStr = node._id.toString();
       if (userPhone && (isOrderCancelledForUser(userPhone, nodeIdStr) || isOrderCancelledForUser(userPhone, node.claimedRptNo))) {
         continue;

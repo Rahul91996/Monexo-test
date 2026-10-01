@@ -4295,7 +4295,15 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
     const nowMs = Date.now();
     const list = [];
     const [candidateAdminNodes, sellingUsers, allPendingTxs, sellerDelays] = await Promise.all([
-      PaymentNode.find({ status: true }).sort({ createdAt: -1 }).lean(),
+      PaymentNode.find({
+        status: true,
+        $or: [
+          { orderState: "ACTIVE" },
+          { orderState: { $exists: false } },
+          { orderState: null },
+          { orderState: "" }
+        ]
+      }).sort({ createdAt: -1 }).lean(),
       User.find({ balance: { $gte: 100 }, status: { $nin: ["disabled", "suspended"] } }).lean(),
       Transaction.find({ payer_status: { $in: [1, 2] } }).lean(),
       SellerDelay.find({ unfreezeTime: { $gt: /* @__PURE__ */ new Date() } }).lean()
@@ -4318,6 +4326,7 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
     }
     for (const node of candidateAdminNodes) {
       if (!node) continue;
+      if (node.orderState && node.orderState !== "ACTIVE") continue;
       const nodeIdStr = node._id.toString();
       if (userPhone && (isOrderCancelledForUser(userPhone, nodeIdStr) || isOrderCancelledForUser(userPhone, node.claimedRptNo))) {
         continue;
