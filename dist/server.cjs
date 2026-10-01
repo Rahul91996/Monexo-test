@@ -4264,58 +4264,10 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
     const minAmt = req.query.min_amount !== void 0 && req.query.min_amount !== "" ? Number(req.query.min_amount) : void 0;
     const maxAmt = req.query.max_amount !== void 0 && req.query.max_amount !== "" ? Number(req.query.max_amount) : void 0;
     const reqAmtParam = req.query.amount !== void 0 && req.query.amount !== "" ? Number(req.query.amount) : void 0;
-    if (userPhone && buyerActiveOrderMap.has(userPhone)) {
-      const cached = buyerActiveOrderMap.get(userPhone);
-      const cachedAmt = Number(cached?.orderObj?.amount || 0);
-      let amountMatches = true;
-      if (reqAmtParam !== void 0 && reqAmtParam > 0) {
-        if (cachedAmt !== reqAmtParam) amountMatches = false;
-      }
-      if (minAmt !== void 0 && maxAmt !== void 0) {
-        if (cachedAmt < minAmt || cachedAmt > maxAmt) amountMatches = false;
-      }
-      const cachedRpt = cached?.rptNo || cached?.orderObj?.rptNo || "";
-      const isPickedInDb = cachedRpt ? await Transaction.exists({
-        $or: [
-          { rptNo: { $in: [cachedRpt, `SELL_${cachedRpt}`, cachedRpt.replace(/^SELL_/i, "")] } },
-          { _id: isValidObjectId(cachedRpt) ? cachedRpt : null }
-        ].filter(Boolean),
-        payer_status: { $gte: 1 }
-      }) : false;
-      const isSlipCancelled = cachedRpt ? orderSlipMap.get(cachedRpt)?.payer_status === 4 : false;
-      const isUserCancelled = cachedRpt ? isOrderCancelledForUser(userPhone, cachedRpt) || cached?.orderObj?.nodeId && isOrderCancelledForUser(userPhone, cached.orderObj.nodeId) : false;
-      if (cached && !isPickedInDb && !isSlipCancelled && !isUserCancelled && cached.createdAt && Date.now() - cached.createdAt < 6e5 && amountMatches) {
-        let isNodeStillActive = true;
-        if (cached.orderObj?.isAdminNode || cached.orderObj?.nodeId || cached.slipItem?.nodeId) {
-          const nId = cached.orderObj?.nodeId || cached.slipItem?.nodeId;
-          if (nId) {
-            const activeNodeExists = await PaymentNode.exists({
-              _id: nId,
-              status: true,
-              orderState: { $nin: ["COMPLETED", "CANCELLED", "EXPIRED"] }
-            });
-            if (!activeNodeExists) isNodeStillActive = false;
-          }
-        }
-        if (isNodeStillActive) {
-          return res.json({
-            code: 0,
-            msg: "success",
-            data: { total: 1, list: [cached.orderObj] }
-          });
-        } else {
-          buyerActiveOrderMap.delete(userPhone);
-        }
-      } else {
-        buyerActiveOrderMap.delete(userPhone);
-      }
-    }
     const nowMs = Date.now();
     const list = [];
     const [candidateAdminNodes, sellingUsers, allPendingTxs, sellerDelays] = await Promise.all([
-      PaymentNode.find({
-        $or: [{ status: true }, { status: 1 }, { status: "true" }]
-      }).sort({ createdAt: -1 }).lean(),
+      PaymentNode.find({ status: { $ne: false } }).sort({ createdAt: -1 }).lean(),
       User.find({ balance: { $gte: 100 }, status: { $nin: ["disabled", "suspended"] } }).lean(),
       Transaction.find({ payer_status: { $in: [1, 2] } }).lean(),
       SellerDelay.find({ unfreezeTime: { $gt: /* @__PURE__ */ new Date() } }).lean()
