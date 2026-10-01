@@ -235,6 +235,8 @@ async function connectToDatabase() {
       dropLegacyIndexes().catch(() => {
       });
       seedAdminAccounts().catch((err) => console.error("Error seeding admin accounts on connection:", err));
+      cleanupCorruptedPaymentNodes().catch(() => {
+      });
       return conn;
     }).catch((err) => {
       cachedDbPromise = null;
@@ -243,6 +245,20 @@ async function connectToDatabase() {
     });
   }
   return cachedDbPromise;
+}
+async function cleanupCorruptedPaymentNodes() {
+  try {
+    await PaymentNode.updateMany(
+      {
+        $or: [{ claimedByPhone: "" }, { claimedByPhone: null }, { claimedByPhone: { $exists: false } }],
+        $or: [{ claimedRptNo: "" }, { claimedRptNo: null }, { claimedRptNo: { $exists: false } }]
+      },
+      {
+        $set: { orderState: "ACTIVE", status: true }
+      }
+    );
+  } catch (e) {
+  }
 }
 app.use(async (req, res, next) => {
   const reqPath = req.path || req.url || "";
@@ -10921,10 +10937,9 @@ app.get("/xxapi/admin/nodes", requireAdmin, async (req, res) => {
       if (t && t.rptNo) txMap.set(t.rptNo, t);
     }
     const enrichedNodes = nodes.map((n) => {
-      let state = n.orderState || "ACTIVE";
-      let remainingSeconds = 0;
-      let txUtr = n.utr || "";
       let buyerPhone = n.claimedByPhone || "";
+      let txUtr = n.utr || "";
+      let state = n.orderState || "ACTIVE";
       if (n.claimedRptNo) {
         const tx = txMap.get(n.claimedRptNo);
         if (tx) {
@@ -10939,19 +10954,18 @@ app.get("/xxapi/admin/nodes", requireAdmin, async (req, res) => {
           }
         }
       }
+      if (!n.claimedRptNo && !buyerPhone) {
+        state = "ACTIVE";
+      }
+      let remainingSeconds = 0;
       if (state === "ACTIVE" && n.displayEndTime) {
         const diffMs = new Date(n.displayEndTime).getTime() - now;
         remainingSeconds = Math.max(0, Math.floor(diffMs / 1e3));
-        if (remainingSeconds <= 0) {
-          state = "EXPIRED";
-        }
-      } else {
-        remainingSeconds = 0;
       }
       return {
         ...n,
         orderState: state,
-        claimedByPhone: buyerPhone || n.claimedByPhone || "",
+        claimedByPhone: buyerPhone,
         remainingSeconds,
         utr: txUtr,
         verifiedName: n.name
@@ -10978,10 +10992,9 @@ app.get("/xxapi/admin/nodeHistory", requireAdmin, async (req, res) => {
       if (t && t.rptNo) txMap.set(t.rptNo, t);
     }
     const enrichedHistory = nodes.map((n) => {
-      let state = n.orderState || "ACTIVE";
-      let remainingSeconds = 0;
-      let txUtr = n.utr || "";
       let buyerPhone = n.claimedByPhone || "";
+      let txUtr = n.utr || "";
+      let state = n.orderState || "ACTIVE";
       if (n.claimedRptNo) {
         const tx = txMap.get(n.claimedRptNo);
         if (tx) {
@@ -10996,19 +11009,18 @@ app.get("/xxapi/admin/nodeHistory", requireAdmin, async (req, res) => {
           }
         }
       }
+      if (!n.claimedRptNo && !buyerPhone) {
+        state = "ACTIVE";
+      }
+      let remainingSeconds = 0;
       if (state === "ACTIVE" && n.displayEndTime) {
         const diffMs = new Date(n.displayEndTime).getTime() - now;
         remainingSeconds = Math.max(0, Math.floor(diffMs / 1e3));
-        if (remainingSeconds <= 0) {
-          state = "EXPIRED";
-        }
-      } else {
-        remainingSeconds = 0;
       }
       return {
         ...n,
         orderState: state,
-        claimedByPhone: buyerPhone || n.claimedByPhone || "",
+        claimedByPhone: buyerPhone,
         remainingSeconds,
         utr: txUtr,
         displayEndTimeFormatted: n.displayEndTime ? new Date(n.displayEndTime).toLocaleString() : ""
