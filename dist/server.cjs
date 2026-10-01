@@ -912,6 +912,18 @@ function generate15DigitRptNo() {
   }
   return result;
 }
+function getAdminNode15DigitRptNo(node) {
+  if (!node) return generate15DigitRptNo();
+  if (node.claimedRptNo && String(node.claimedRptNo).length === 15 && /^\d+$/.test(String(node.claimedRptNo))) {
+    return String(node.claimedRptNo);
+  }
+  const idHex = String(node._id || "");
+  let numStr = "401";
+  for (let i = 0; i < idHex.length; i++) {
+    numStr += (idHex.charCodeAt(i) % 10).toString();
+  }
+  return numStr.slice(0, 15).padEnd(15, "0");
+}
 var orderSlipMap = /* @__PURE__ */ new Map();
 function generateOrderChunks(balance, requestedAmt, isAdminOrder = false) {
   if (balance < 100) return [];
@@ -4296,7 +4308,7 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
       if (userPhone && (isOrderCancelledForUser(userPhone, nodeIdStr) || isOrderCancelledForUser(userPhone, node.claimedRptNo))) {
         continue;
       }
-      const rptNo = node.claimedRptNo || generate15DigitRptNo();
+      const rptNo = getAdminNode15DigitRptNo(node);
       const methodVal = node.type === "upi" ? 1 : 2;
       const nodeCtType = reqCtType || 1;
       const nodeCtime = Math.floor(new Date(node.createdAt || Date.now()).getTime() / 1e3);
@@ -10997,7 +11009,7 @@ app.post("/xxapi/admin/nodes", requireAdmin, async (req, res) => {
     if (!name || !type || !accountNumber || amount === void 0) {
       return res.json({ code: 400, msg: "Missing required fields" });
     }
-    const duration = Number(displayDuration) || 300;
+    const duration = Number(displayDuration) || 86400;
     const endTime = new Date(Date.now() + duration * 1e3);
     const node = new PaymentNode({
       name,
@@ -11039,7 +11051,7 @@ app.put("/xxapi/admin/nodes/:id", requireAdmin, async (req, res) => {
     if (status !== void 0) node.status = Boolean(status);
     if (displayDuration !== void 0) node.displayDuration = Number(displayDuration);
     if (status === true || resetTimer || node.status === true && node.orderState !== "ACTIVE") {
-      const dur = Number(displayDuration) || node.displayDuration || 300;
+      const dur = Number(displayDuration) || node.displayDuration || 86400;
       node.displayEndTime = new Date(Date.now() + dur * 1e3);
       node.orderState = "ACTIVE";
       node.claimedByPhone = "";

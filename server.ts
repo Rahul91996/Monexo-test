@@ -1007,6 +1007,19 @@ function generate15DigitRptNo(): string {
   return result;
 }
 
+function getAdminNode15DigitRptNo(node: any): string {
+  if (!node) return generate15DigitRptNo();
+  if (node.claimedRptNo && String(node.claimedRptNo).length === 15 && /^\d+$/.test(String(node.claimedRptNo))) {
+    return String(node.claimedRptNo);
+  }
+  const idHex = String(node._id || '');
+  let numStr = '401';
+  for (let i = 0; i < idHex.length; i++) {
+    numStr += (idHex.charCodeAt(i) % 10).toString();
+  }
+  return numStr.slice(0, 15).padEnd(15, '0');
+}
+
 interface OrderSlipItem {
   rptNo: string;
   sellerId?: string;
@@ -5122,7 +5135,7 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
         continue;
       }
 
-      const rptNo = node.claimedRptNo || generate15DigitRptNo();
+      const rptNo = getAdminNode15DigitRptNo(node);
       const methodVal = node.type === 'upi' ? 1 : 2;
       const nodeCtType = reqCtType || 1;
       const nodeCtime = Math.floor(new Date(node.createdAt || Date.now()).getTime() / 1000);
@@ -12872,7 +12885,7 @@ app.post('/xxapi/admin/nodes', requireAdmin, async (req: any, res: any) => {
     if (!name || !type || !accountNumber || amount === undefined) {
       return res.json({ code: 400, msg: 'Missing required fields' });
     }
-    const duration = Number(displayDuration) || 300;
+    const duration = Number(displayDuration) || 86400;
     const endTime = new Date(Date.now() + duration * 1000);
 
     const node = new PaymentNode({
@@ -12916,7 +12929,7 @@ app.put('/xxapi/admin/nodes/:id', requireAdmin, async (req, res) => {
     if (status !== undefined) node.status = Boolean(status);
     if (displayDuration !== undefined) node.displayDuration = Number(displayDuration);
     if (status === true || resetTimer || (node.status === true && node.orderState !== 'ACTIVE')) {
-      const dur = Number(displayDuration) || node.displayDuration || 300;
+      const dur = Number(displayDuration) || node.displayDuration || 86400;
       node.displayEndTime = new Date(Date.now() + dur * 1000);
       node.orderState = 'ACTIVE';
       node.claimedByPhone = '';
