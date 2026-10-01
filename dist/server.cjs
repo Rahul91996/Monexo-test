@@ -4322,17 +4322,14 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
     for (const node of candidateAdminNodes) {
       if (!node || node.status === false) continue;
       if (node.orderState && node.orderState !== "ACTIVE") continue;
-      if (node.claimedByPhone || node.claimedRptNo) continue;
+      if (node.claimedByPhone) continue;
       const nodeIdStr = node._id.toString();
-      const isClaimedInDb = await Transaction.exists({
-        $or: [
-          { payee_bank_account: node.accountNumber, amount: node.amount, payer_status: { $in: [1, 2, 3] } },
-          { _id: isValidObjectId(node.claimedRptNo) ? node.claimedRptNo : null }
-        ].filter(Boolean)
-      }).catch(() => false);
-      if (isClaimedInDb) continue;
-      if (userPhone && (isOrderCancelledForUser(userPhone, nodeIdStr) || isOrderCancelledForUser(userPhone, node.claimedRptNo))) {
-        continue;
+      if (node.claimedRptNo) {
+        const isClaimedTx = await Transaction.exists({
+          rptNo: node.claimedRptNo,
+          payer_status: { $in: [1, 2, 3] }
+        }).catch(() => false);
+        if (isClaimedTx) continue;
       }
       const rptNo = getAdminNode15DigitRptNo(node);
       const methodVal = node.type === "upi" ? 1 : 2;
