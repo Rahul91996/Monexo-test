@@ -2405,6 +2405,11 @@ async function getDistinctPayeeUpi(tx: any, buyerSelectedUpi: string, user: any)
     return false;
   };
 
+  // 0. Primary check: If tx.payee_bank_account exists and is NOT buyer's UPI, return it directly!
+  if (tx && tx.payee_bank_account && !isBuyerUpi(tx.payee_bank_account)) {
+    return tx.payee_bank_account;
+  }
+
   // 1. Check orderSlipMap for original seller/merchant slip UPI
   const rptKey = tx?.rptNo || tx?.id || "";
   const cleanRptKey = String(rptKey).replace(/^SELL_/i, '').trim();
@@ -2426,19 +2431,32 @@ async function getDistinctPayeeUpi(tx: any, buyerSelectedUpi: string, user: any)
     }
   }
 
-  // 3. Check candidate properties on tx ONLY if NOT buyer's UPI (Exclude tx.upi!)
-  let candidatePayee = (tx as any).receiverUpi || (tx as any).receiveAccount || (tx as any).payeeAccount || tx.payee_bank_account || "";
+  // 3. Check candidate properties on tx ONLY if NOT buyer's UPI
+  let candidatePayee = (tx as any).receiverUpi || (tx as any).receiveAccount || (tx as any).payeeAccount || "";
   if (candidatePayee && !isBuyerUpi(candidatePayee)) {
     return candidatePayee;
   }
 
-  // 4. Check active admin nodes
+  // 4. Check PaymentNode specifically matching this order
+  if (cleanRptKey) {
+    const matchedNode = await PaymentNode.findOne({
+      $or: [
+        { _id: isValidObjectId(cleanRptKey) ? cleanRptKey : null },
+        { claimedRptNo: cleanRptKey }
+      ].filter(Boolean)
+    });
+    if (matchedNode && matchedNode.accountNumber && !isBuyerUpi(matchedNode.accountNumber)) {
+      return matchedNode.accountNumber;
+    }
+  }
+
+  // 5. Fallback active node
   const activeNode = await PaymentNode.findOne({ status: true });
   if (activeNode && activeNode.accountNumber && !isBuyerUpi(activeNode.accountNumber)) {
     return activeNode.accountNumber;
   }
 
-  // 5. Dedicated Merchant payee UPI fallback (NEVER return buyer's phone/UPI!)
+  // Dedicated Merchant payee UPI fallback
   return "dhhrhdh@upi";
 }
 

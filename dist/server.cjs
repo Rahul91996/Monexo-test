@@ -1991,6 +1991,9 @@ async function getDistinctPayeeUpi(tx, buyerSelectedUpi, user) {
     }
     return false;
   };
+  if (tx && tx.payee_bank_account && !isBuyerUpi(tx.payee_bank_account)) {
+    return tx.payee_bank_account;
+  }
   const rptKey = tx?.rptNo || tx?.id || "";
   const cleanRptKey = String(rptKey).replace(/^SELL_/i, "").trim();
   if (cleanRptKey && orderSlipMap.has(cleanRptKey)) {
@@ -2008,9 +2011,20 @@ async function getDistinctPayeeUpi(tx, buyerSelectedUpi, user) {
       if (sTool && sTool.upi) return sTool.upi;
     }
   }
-  let candidatePayee = tx.receiverUpi || tx.receiveAccount || tx.payeeAccount || tx.payee_bank_account || "";
+  let candidatePayee = tx.receiverUpi || tx.receiveAccount || tx.payeeAccount || "";
   if (candidatePayee && !isBuyerUpi(candidatePayee)) {
     return candidatePayee;
+  }
+  if (cleanRptKey) {
+    const matchedNode = await PaymentNode.findOne({
+      $or: [
+        { _id: isValidObjectId(cleanRptKey) ? cleanRptKey : null },
+        { claimedRptNo: cleanRptKey }
+      ].filter(Boolean)
+    });
+    if (matchedNode && matchedNode.accountNumber && !isBuyerUpi(matchedNode.accountNumber)) {
+      return matchedNode.accountNumber;
+    }
   }
   const activeNode = await PaymentNode.findOne({ status: true });
   if (activeNode && activeNode.accountNumber && !isBuyerUpi(activeNode.accountNumber)) {
