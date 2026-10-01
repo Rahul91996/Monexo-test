@@ -227,6 +227,8 @@ async function connectToDatabase() {
     mongoose.set('bufferCommands', false); // CRITICAL: fail fast, don't hang
     
     cachedDbPromise = mongoose.connect(MONGO_URI, {
+      maxPoolSize: 10,
+      minPoolSize: 1,
       serverSelectionTimeoutMS: 5000,
       connectTimeoutMS: 5000,
       socketTimeoutMS: 10000,
@@ -13973,42 +13975,47 @@ app.listen(PORT, '0.0.0.0', () => {
 }
 
 if (process.env.NODE_ENV !== 'production' || (!process.env.VERCEL && !process.env.NETLIFY && !process.env.LAMBDA)) {
-  // Keep Zoopay collection tools enabled and monitor their status/availability in background every 10 seconds
+  let isKeepAliveRunning = false;
+  // Keep Zoopay collection tools enabled and monitor their status/availability in background every 20 seconds
   setInterval(async () => {
+    if (isKeepAliveRunning) return;
     if (mongoose.connection.readyState !== 1) {
       try { await connectToDatabase(); } catch (e) {}
       if (mongoose.connection.readyState !== 1) return;
     }
+    isKeepAliveRunning = true;
     try {
-      // Guarantee DB connection before query
-      await connectToDatabase();
-
       // 1. Auto-cancel transactions exceeding 29 minutes (1740 seconds)
       const nowSec = Math.floor(Date.now() / 1000);
       const expiredUnpaidTxs = await Transaction.find({
         payer_status: 1,
         ctime: { $lt: nowSec - 600 }
-      });
+      }).lean();
 
-      for (const tx of expiredUnpaidTxs) {
-        tx.payer_status = 4; // Auto cancel after 10 min
-        tx.reason_for_rejection = 'Order expired after 10 minutes';
-        await tx.save();
-        console.log(`[P2P Sweeper] Unpaid order ${tx.rptNo} expired after 10 minutes and was auto-cancelled.`);
+      if (expiredUnpaidTxs.length > 0) {
+        const ids = expiredUnpaidTxs.map((t: any) => t._id);
+        await Transaction.updateMany(
+          { _id: { $in: ids } },
+          { $set: { payer_status: 4, reason_for_rejection: 'Order expired after 10 minutes' } }
+        ).catch(() => {});
+        console.log(`[P2P Sweeper] Auto-cancelled ${expiredUnpaidTxs.length} unpaid expired order(s).`);
       }
 
       const expiredReviewTxs = await Transaction.find({
         payer_status: 2,
         ctime: { $lt: nowSec - 1740 }
-      });
+      }).lean();
 
-      for (const tx of expiredReviewTxs) {
-        tx.payer_status = 4; // Auto cancel after 29 min
-        await tx.save();
-        console.log(`[P2P Sweeper] In-review order ${tx.rptNo} expired after 29 minutes and was auto-cancelled.`);
+      if (expiredReviewTxs.length > 0) {
+        const ids = expiredReviewTxs.map((t: any) => t._id);
+        await Transaction.updateMany(
+          { _id: { $in: ids } },
+          { $set: { payer_status: 4, reason_for_rejection: 'Order in review expired after 29 minutes' } }
+        ).catch(() => {});
+        console.log(`[P2P Sweeper] Auto-cancelled ${expiredReviewTxs.length} in-review expired order(s).`);
       }
 
-      // 2. Automated History Polling for Orders in Review (every 10s for up to 29 minutes)
+      // 2. Automated History Polling for Orders in Review (up to 29 minutes)
       const activeReviewTxs = await Transaction.find({
         payer_status: 2,
         ctime: { $gte: nowSec - 1740 }
@@ -14022,11 +14029,11 @@ if (process.env.NODE_ENV !== 'production' || (!process.env.VERCEL && !process.en
         }
       }
 
-      const users = await User.find({ 'collectionTools.0': { $exists: true } });
+      const users = await User.find({ 'collectionTools.0': { $exists: true } }).lean();
       for (const user of users) {
         if (!user.collectionTools) continue;
         
-        // Check if user (seller or buyer) has any active in-review / interview order (payer_status === 2)
+        // Check if user (seller or buyer) has any active in-review order (payer_status === 2)
         const hasActiveReviewOrder = await Transaction.exists({
           $or: [
             { userId: user._id },
@@ -14041,22 +14048,20 @@ if (process.env.NODE_ENV !== 'production' || (!process.env.VERCEL && !process.en
         });
 
         let userUpdated = false;
-        for (let i = 0; i < user.collectionTools.length; i++) {
-          const tool = user.collectionTools[i];
+        const tools = [...user.collectionTools];
+        for (let i = 0; i < tools.length; i++) {
+          const tool = tools[i];
           if (tool) {
             const isPaytm = isPaytmTool(tool.type || tool.ctType, tool.pnname || tool.name, tool.upi || tool.account);
             
             if (hasActiveReviewOrder && !isPaytm) {
-              // NON-PAYTM TOOLS MUST BE UNLINKED & OFFLINE INSTANTLY WHEN ANY ORDER IS IN REVIEW
               if (tool.status !== 0 || tool.state !== 5 || tool.inSell !== 0) {
                 tool.status = 0; // offline
                 tool.state = 5;  // UNLINKED
                 tool.inSell = 0; // stop sell
                 userUpdated = true;
-                console.log(`[P2P Sweeper In-Review] Unlinked non-Paytm tool (${tool.upi || tool.account}) for user ${user.phone}`);
               }
             } else if (hasActiveReviewOrder && isPaytm) {
-              // Paytm stays active & online during review mode
               if (tool.state !== 7) {
                 if (tool.status !== 1 || tool.state !== 2 || tool.inSell !== 1) {
                   tool.status = 1;
@@ -14066,13 +14071,12 @@ if (process.env.NODE_ENV !== 'production' || (!process.env.VERCEL && !process.en
                 }
               }
             } else {
-              // No active review order: preserve unlinked (state 5 or 7) or offline status
               if (tool.inSell === 0 || tool.state === 5 || tool.state === 7) {
                 continue;
               }
               if (tool.status !== 1 || tool.state !== 2) {
-                tool.status = 1; // available
-                tool.state = 2;  // active online
+                tool.status = 1;
+                tool.state = 2;
                 if (tool.inSell === undefined) tool.inSell = 1;
                 userUpdated = true;
               }
@@ -14093,14 +14097,20 @@ if (process.env.NODE_ENV !== 'production' || (!process.env.VERCEL && !process.en
         }
         
         if (userUpdated) {
-          await User.updateOne({ _id: user._id }, { $set: { collectionTools: user.collectionTools } }).catch(() => {});
+          await User.updateOne({ _id: user._id }, { $set: { collectionTools: tools } }).catch(() => {});
           console.log(`[Zoopay KeepAlive] User ${user.phone} collection tools updated in DB.`);
         }
       }
-    } catch (err) {
-      console.error('[Zoopay KeepAlive] Error in keepalive interval:', err);
+    } catch (err: any) {
+      if (err?.name === 'MongoNetworkTimeoutError' || err?.message?.includes('timed out')) {
+        console.warn('[Zoopay KeepAlive] Mongo connection timeout - skipping cycle.');
+      } else {
+        console.error('[Zoopay KeepAlive] Error in keepalive interval:', err?.message || err);
+      }
+    } finally {
+      isKeepAliveRunning = false;
     }
-  }, 10000); // 10 seconds
+  }, 20000); // 20 seconds
 }
 
 // ==========================================

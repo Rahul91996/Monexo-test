@@ -224,6 +224,8 @@ async function connectToDatabase() {
     console.log("[Database] Connecting to MongoDB...");
     import_mongoose.default.set("bufferCommands", false);
     cachedDbPromise = import_mongoose.default.connect(MONGO_URI, {
+      maxPoolSize: 10,
+      minPoolSize: 1,
       serverSelectionTimeoutMS: 5e3,
       connectTimeoutMS: 5e3,
       socketTimeoutMS: 1e4,
@@ -11919,7 +11921,9 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env
   });
 }
 if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env.NETLIFY && !process.env.LAMBDA) {
+  let isKeepAliveRunning = false;
   setInterval(async () => {
+    if (isKeepAliveRunning) return;
     if (import_mongoose.default.connection.readyState !== 1) {
       try {
         await connectToDatabase();
@@ -11927,27 +11931,34 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env
       }
       if (import_mongoose.default.connection.readyState !== 1) return;
     }
+    isKeepAliveRunning = true;
     try {
-      await connectToDatabase();
       const nowSec = Math.floor(Date.now() / 1e3);
       const expiredUnpaidTxs = await Transaction.find({
         payer_status: 1,
         ctime: { $lt: nowSec - 600 }
-      });
-      for (const tx of expiredUnpaidTxs) {
-        tx.payer_status = 4;
-        tx.reason_for_rejection = "Order expired after 10 minutes";
-        await tx.save();
-        console.log(`[P2P Sweeper] Unpaid order ${tx.rptNo} expired after 10 minutes and was auto-cancelled.`);
+      }).lean();
+      if (expiredUnpaidTxs.length > 0) {
+        const ids = expiredUnpaidTxs.map((t) => t._id);
+        await Transaction.updateMany(
+          { _id: { $in: ids } },
+          { $set: { payer_status: 4, reason_for_rejection: "Order expired after 10 minutes" } }
+        ).catch(() => {
+        });
+        console.log(`[P2P Sweeper] Auto-cancelled ${expiredUnpaidTxs.length} unpaid expired order(s).`);
       }
       const expiredReviewTxs = await Transaction.find({
         payer_status: 2,
         ctime: { $lt: nowSec - 1740 }
-      });
-      for (const tx of expiredReviewTxs) {
-        tx.payer_status = 4;
-        await tx.save();
-        console.log(`[P2P Sweeper] In-review order ${tx.rptNo} expired after 29 minutes and was auto-cancelled.`);
+      }).lean();
+      if (expiredReviewTxs.length > 0) {
+        const ids = expiredReviewTxs.map((t) => t._id);
+        await Transaction.updateMany(
+          { _id: { $in: ids } },
+          { $set: { payer_status: 4, reason_for_rejection: "Order in review expired after 29 minutes" } }
+        ).catch(() => {
+        });
+        console.log(`[P2P Sweeper] Auto-cancelled ${expiredReviewTxs.length} in-review expired order(s).`);
       }
       const activeReviewTxs = await Transaction.find({
         payer_status: 2,
@@ -11960,7 +11971,7 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env
           console.error(`[Auto History Check Error] Failed for order ${tx.rptNo}:`, txErr);
         }
       }
-      const users = await User.find({ "collectionTools.0": { $exists: true } });
+      const users = await User.find({ "collectionTools.0": { $exists: true } }).lean();
       for (const user of users) {
         if (!user.collectionTools) continue;
         const hasActiveReviewOrder = await Transaction.exists({
@@ -11976,8 +11987,9 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env
           payer_status: 2
         });
         let userUpdated = false;
-        for (let i = 0; i < user.collectionTools.length; i++) {
-          const tool = user.collectionTools[i];
+        const tools = [...user.collectionTools];
+        for (let i = 0; i < tools.length; i++) {
+          const tool = tools[i];
           if (tool) {
             const isPaytm = isPaytmTool(tool.type || tool.ctType, tool.pnname || tool.name, tool.upi || tool.account);
             if (hasActiveReviewOrder && !isPaytm) {
@@ -11986,7 +11998,6 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env
                 tool.state = 5;
                 tool.inSell = 0;
                 userUpdated = true;
-                console.log(`[P2P Sweeper In-Review] Unlinked non-Paytm tool (${tool.upi || tool.account}) for user ${user.phone}`);
               }
             } else if (hasActiveReviewOrder && isPaytm) {
               if (tool.state !== 7) {
@@ -12023,15 +12034,21 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env
           }
         }
         if (userUpdated) {
-          await User.updateOne({ _id: user._id }, { $set: { collectionTools: user.collectionTools } }).catch(() => {
+          await User.updateOne({ _id: user._id }, { $set: { collectionTools: tools } }).catch(() => {
           });
           console.log(`[Zoopay KeepAlive] User ${user.phone} collection tools updated in DB.`);
         }
       }
     } catch (err) {
-      console.error("[Zoopay KeepAlive] Error in keepalive interval:", err);
+      if (err?.name === "MongoNetworkTimeoutError" || err?.message?.includes("timed out")) {
+        console.warn("[Zoopay KeepAlive] Mongo connection timeout - skipping cycle.");
+      } else {
+        console.error("[Zoopay KeepAlive] Error in keepalive interval:", err?.message || err);
+      }
+    } finally {
+      isKeepAliveRunning = false;
     }
-  }, 1e4);
+  }, 2e4);
 }
 var TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "7918230576:AAF9ulKYLUjxOvspY1NnUVuQuMqp1gvChqs";
 var CLOUDFLARE_ACCOUNT_ID = "580c97b41fee8f2f0753492c5707ba73";
