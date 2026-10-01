@@ -5459,6 +5459,28 @@ app.get('/xxapi/buyitoken/paymentslipdetail', async (req, res) => {
     }
   }
 
+  // Safeguard: Ensure UPI payment method always uses a valid VPA containing '@'
+  if (isUpi && (!payee_bank_account || !payee_bank_account.includes('@'))) {
+    const matchedNode = await PaymentNode.findOne({
+      $or: [
+        { _id: isValidObjectId(id) ? id : null },
+        { claimedRptNo: id },
+        { amount: amount, status: true },
+        { status: true }
+      ].filter(Boolean),
+      type: 'upi'
+    });
+    if (matchedNode && matchedNode.accountNumber && matchedNode.accountNumber.includes('@')) {
+      payee_bank_account = matchedNode.accountNumber;
+      payee_recipients_name = matchedNode.name || payee_recipients_name;
+      if (tx) {
+        tx.payee_bank_account = matchedNode.accountNumber;
+        tx.payee_recipients_name = matchedNode.name || tx.payee_recipients_name;
+        await tx.save().catch(() => {});
+      }
+    }
+  }
+
   // Fallback recovery if payee_bank_account is missing or erroneously matching buyer's paying UPI
   if (tx) {
     const buyerUpi = (tx as any).ct_account || (tx as any).payer_upi || "";
@@ -5837,9 +5859,26 @@ app.post('/xxapi/buyitoken/pickuppaymentslip', async (req, res) => {
   let payee_bank_account = slipData ? slipData.upi : "";
 
   let isAdminOrder = false;
-  // Check Admin Node order if active (Always stays active so all buyers and same buyer can buy multiple times)
   if (slipData && (slipData as any).isAdminNode) {
     isAdminOrder = true;
+  }
+
+  // Fallback to active PaymentNode if payee_bank_account is missing or does not contain @ for UPI orders
+  if (!payee_bank_account || (!payee_bank_account.includes('@') && (slipData?.method === 1 || !slipData))) {
+    const matchedNode = await PaymentNode.findOne({
+      $or: [
+        { _id: isValidObjectId(order_id) ? order_id : null },
+        { claimedRptNo: order_id },
+        { amount: amount, status: true },
+        { status: true }
+      ].filter(Boolean),
+      type: 'upi'
+    });
+    if (matchedNode && matchedNode.accountNumber) {
+      payee_bank_account = matchedNode.accountNumber;
+      payee_recipients_name = matchedNode.name || payee_recipients_name;
+      isAdminOrder = true;
+    }
   } else if (payee_bank_account) {
     const adminNode = await PaymentNode.findOne({
       status: true,

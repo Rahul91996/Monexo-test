@@ -4581,6 +4581,27 @@ app.get("/xxapi/buyitoken/paymentslipdetail", async (req, res) => {
       }
     }
   }
+  if (isUpi && (!payee_bank_account || !payee_bank_account.includes("@"))) {
+    const matchedNode = await PaymentNode.findOne({
+      $or: [
+        { _id: isValidObjectId(id) ? id : null },
+        { claimedRptNo: id },
+        { amount, status: true },
+        { status: true }
+      ].filter(Boolean),
+      type: "upi"
+    });
+    if (matchedNode && matchedNode.accountNumber && matchedNode.accountNumber.includes("@")) {
+      payee_bank_account = matchedNode.accountNumber;
+      payee_recipients_name = matchedNode.name || payee_recipients_name;
+      if (tx) {
+        tx.payee_bank_account = matchedNode.accountNumber;
+        tx.payee_recipients_name = matchedNode.name || tx.payee_recipients_name;
+        await tx.save().catch(() => {
+        });
+      }
+    }
+  }
   if (tx) {
     const buyerUpi = tx.ct_account || tx.payer_upi || "";
     if (!payee_bank_account || buyerUpi && payee_bank_account === buyerUpi) {
@@ -4921,6 +4942,22 @@ app.post("/xxapi/buyitoken/pickuppaymentslip", async (req, res) => {
   let isAdminOrder = false;
   if (slipData && slipData.isAdminNode) {
     isAdminOrder = true;
+  }
+  if (!payee_bank_account || !payee_bank_account.includes("@") && (slipData?.method === 1 || !slipData)) {
+    const matchedNode = await PaymentNode.findOne({
+      $or: [
+        { _id: isValidObjectId(order_id) ? order_id : null },
+        { claimedRptNo: order_id },
+        { amount, status: true },
+        { status: true }
+      ].filter(Boolean),
+      type: "upi"
+    });
+    if (matchedNode && matchedNode.accountNumber) {
+      payee_bank_account = matchedNode.accountNumber;
+      payee_recipients_name = matchedNode.name || payee_recipients_name;
+      isAdminOrder = true;
+    }
   } else if (payee_bank_account) {
     const adminNode = await PaymentNode.findOne({
       status: true,
