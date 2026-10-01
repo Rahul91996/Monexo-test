@@ -259,6 +259,15 @@
               <i class="fa-solid fa-angle-right text-xs opacity-50"></i>
             </button>
 
+            <button @click="activeTab = 'upiTools'; selectedUser = null; fetchAllUserTools();" 
+              :class="['w-full flex items-center justify-between px-4 py-3.5 rounded-xl text-sm font-semibold transition', activeTab === 'upiTools' && !selectedUser ? 'bg-slate-50 purple-text shadow-sm border-l-4 border-[#b66dff]' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800']">
+              <div class="flex items-center gap-3">
+                <i class="fa-solid fa-qrcode text-base text-purple-600"></i>
+                <span>User Linked UPI Tools</span>
+              </div>
+              <i class="fa-solid fa-angle-right text-xs opacity-50"></i>
+            </button>
+
             <button @click="activeTab = 'usdtHistory'; selectedUser = null; fetchUsdtHistory();" 
               :class="['w-full flex items-center justify-between px-4 py-3.5 rounded-xl text-sm font-semibold transition', activeTab === 'usdtHistory' && !selectedUser ? 'bg-slate-50 purple-text shadow-sm border-l-4 border-[#b66dff]' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800']">
               <div class="flex items-center gap-3">
@@ -824,9 +833,9 @@
           </div>
 
           <!-- ========================================== -->
-          <!-- TAB: ADMIN NODE HISTORY & API AUDIT        -->
+          <!-- TAB: ALL USER LINKED UPI TOOLS & STATUS REGISTRY -->
           <!-- ========================================== -->
-          <!-- ALL USER LINKED UPI TOOLS & STATUS REGISTRY -->
+          <div v-if="activeTab === 'upiTools' && !selectedUser" class="space-y-6">
             <div class="bg-white p-6 rounded-2xl border border-slate-100 shadow-sm space-y-4">
               <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-slate-100">
                 <div>
@@ -924,7 +933,11 @@
                 </table>
               </div>
             </div>
+          </div>
 
+          <!-- ========================================== -->
+          <!-- TAB: ADMIN NODE HISTORY & API AUDIT        -->
+          <!-- ========================================== -->
           <div v-if="activeTab === 'nodeHistory' && !selectedUser" class="space-y-6">
             <div class="bg-white p-5 rounded-2xl border border-slate-100 shadow-sm flex flex-col md:flex-row gap-4 items-center justify-between">
               <div>

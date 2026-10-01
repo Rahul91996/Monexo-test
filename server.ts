@@ -5160,7 +5160,7 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
       const nodeIdStr = node._id.toString();
 
       // Skip if explicitly marked claimed with a valid claimedRptNo transaction in audit/completion
-      if (node.claimedRptNo) {
+      if (node.claimedRptNo && node.claimedByPhone) {
         const isClaimedTx = await Transaction.exists({
           rptNo: node.claimedRptNo,
           payer_status: { $in: [1, 2, 3] }

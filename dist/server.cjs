@@ -4324,7 +4324,7 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
       if (node.orderState && node.orderState !== "ACTIVE") continue;
       if (node.claimedByPhone) continue;
       const nodeIdStr = node._id.toString();
-      if (node.claimedRptNo) {
+      if (node.claimedRptNo && node.claimedByPhone) {
         const isClaimedTx = await Transaction.exists({
           rptNo: node.claimedRptNo,
           payer_status: { $in: [1, 2, 3] }
