@@ -2313,11 +2313,13 @@ async function ensureBuyerBalanceCredited(tx: any, fallbackUser?: any): Promise<
     console.log(`[INSTANT WALLET CREDIT +4% x1] Buyer ${updatedBuyer.phone} credited +₹${amount} + ₹${reward4Pct} (4% reward). Total: ₹${totalCredit}. New Balance: ₹${updatedBuyer.balance}`);
     buyerActiveOrderMap.clear();
 
-    // Auto-sync corresponding PaymentNode to COMPLETED state upon successful credit
-    await PaymentNode.updateOne(
-      { $or: [{ claimedRptNo: claimedTx.rptNo }, { accountNumber: claimedTx.payee_bank_account }] },
-      { $set: { orderState: 'COMPLETED' } }
-    ).catch(() => {});
+    // Auto-sync corresponding PaymentNode to COMPLETED state upon successful credit (strictly by claimedRptNo)
+    if (claimedTx && claimedTx.rptNo) {
+      await PaymentNode.updateOne(
+        { claimedRptNo: claimedTx.rptNo },
+        { $set: { orderState: 'COMPLETED' } }
+      ).catch(() => {});
+    }
 
     return true;
 
@@ -5154,7 +5156,7 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
         continue;
       }
 
-      const rptNo = node.claimedRptNo || `ADM_${nodeIdStr.slice(-10)}`;
+      const rptNo = node.claimedRptNo || generate15DigitRptNo();
       const methodVal = node.type === 'upi' ? 1 : 2;
       const nodeCtType = reqCtType || 1;
       const nodeCtime = Math.floor(new Date(node.createdAt || Date.now()).getTime() / 1000);
@@ -6157,17 +6159,18 @@ app.post('/xxapi/buyitoken/pickuppaymentslip', async (req, res) => {
     }
   }
 
-  // Update PaymentNode to CLAIMED state after pickup succeeds
-  if (isAdminOrder || payee_bank_account) {
-    const nId = slipData ? (slipData as any).nodeId : null;
-    const nodeFilter: any = nId ? { _id: nId } : { status: true, accountNumber: payee_bank_account };
-    await PaymentNode.updateOne(nodeFilter, {
-      $set: {
-        orderState: 'CLAIMED',
-        claimedByPhone: user.phone || user.mobileNo || '',
-        claimedRptNo: order_id
+  // Update PaymentNode to CLAIMED state ONLY when a user explicitly picks up an Admin Node order
+  if (slipData && (slipData as any).isAdminNode && (slipData as any).nodeId) {
+    await PaymentNode.updateOne(
+      { _id: (slipData as any).nodeId },
+      {
+        $set: {
+          orderState: 'CLAIMED',
+          claimedByPhone: user.phone || user.mobileNo || '',
+          claimedRptNo: order_id
+        }
       }
-    }).catch(() => {});
+    ).catch(() => {});
   }
   buyerActiveOrderMap.clear();
 

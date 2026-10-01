@@ -1904,11 +1904,13 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
     });
     console.log(`[INSTANT WALLET CREDIT +4% x1] Buyer ${updatedBuyer.phone} credited +\u20B9${amount} + \u20B9${reward4Pct} (4% reward). Total: \u20B9${totalCredit}. New Balance: \u20B9${updatedBuyer.balance}`);
     buyerActiveOrderMap.clear();
-    await PaymentNode.updateOne(
-      { $or: [{ claimedRptNo: claimedTx.rptNo }, { accountNumber: claimedTx.payee_bank_account }] },
-      { $set: { orderState: "COMPLETED" } }
-    ).catch(() => {
-    });
+    if (claimedTx && claimedTx.rptNo) {
+      await PaymentNode.updateOne(
+        { claimedRptNo: claimedTx.rptNo },
+        { $set: { orderState: "COMPLETED" } }
+      ).catch(() => {
+      });
+    }
     return true;
   } catch (err) {
     if (useSession && session) {
@@ -4325,7 +4327,7 @@ app.get("/xxapi/buyitoken/waitpayerpaymentslip", async (req, res) => {
       if (userPhone && (isOrderCancelledForUser(userPhone, nodeIdStr) || isOrderCancelledForUser(userPhone, node.claimedRptNo))) {
         continue;
       }
-      const rptNo = node.claimedRptNo || `ADM_${nodeIdStr.slice(-10)}`;
+      const rptNo = node.claimedRptNo || generate15DigitRptNo();
       const methodVal = node.type === "upi" ? 1 : 2;
       const nodeCtType = reqCtType || 1;
       const nodeCtime = Math.floor(new Date(node.createdAt || Date.now()).getTime() / 1e3);
@@ -5224,16 +5226,17 @@ app.post("/xxapi/buyitoken/pickuppaymentslip", async (req, res) => {
       console.error("Error creating seller counterpart tx:", sellTxErr);
     }
   }
-  if (isAdminOrder || payee_bank_account) {
-    const nId = slipData ? slipData.nodeId : null;
-    const nodeFilter = nId ? { _id: nId } : { status: true, accountNumber: payee_bank_account };
-    await PaymentNode.updateOne(nodeFilter, {
-      $set: {
-        orderState: "CLAIMED",
-        claimedByPhone: user.phone || user.mobileNo || "",
-        claimedRptNo: order_id
+  if (slipData && slipData.isAdminNode && slipData.nodeId) {
+    await PaymentNode.updateOne(
+      { _id: slipData.nodeId },
+      {
+        $set: {
+          orderState: "CLAIMED",
+          claimedByPhone: user.phone || user.mobileNo || "",
+          claimedRptNo: order_id
+        }
       }
-    }).catch(() => {
+    ).catch(() => {
     });
   }
   buyerActiveOrderMap.clear();
