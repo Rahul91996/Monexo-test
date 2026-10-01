@@ -5114,17 +5114,13 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
     const nowMs = Date.now();
     const list: any[] = [];
 
-    // 1. HIGH-SPEED PARALLEL PRE-FETCH (All queries run concurrently in < 20ms)
-    const fetchDbWithTimeout = Promise.all([
-      PaymentNode.find({ status: true, orderState: { $nin: ['CLAIMED', 'COMPLETED', 'CANCELLED', 'EXPIRED'] } }).sort({ createdAt: -1 }).lean(),
-      User.find({ balance: { $gte: 1 }, status: { $nin: ['disabled', 'suspended'] } }).lean(),
+    // 1. Fetch DB data reliably
+    const [candidateAdminNodes, sellingUsers, allPendingTxs, sellerDelays] = await Promise.all([
+      PaymentNode.find({ status: true }).sort({ createdAt: -1 }).lean(),
+      User.find({ balance: { $gte: 100 }, status: { $nin: ['disabled', 'suspended'] } }).lean(),
       Transaction.find({ payer_status: { $in: [1, 2] } }).lean(),
       SellerDelay.find({ unfreezeTime: { $gt: new Date() } }).lean()
-    ]);
-
-    const timeoutPromise = new Promise<any>((resolve) => setTimeout(() => resolve([[], [], [], []]), 1200));
-
-    const [candidateAdminNodes, sellingUsers, allPendingTxs, sellerDelays] = await Promise.race([fetchDbWithTimeout, timeoutPromise]).catch(() => [[], [], [], []]);
+    ]).catch(() => [[], [], [], []]);
 
     // Build fast in-memory pending sum map per seller
     const sellerPendingMap = new Map<string, number>();
@@ -5147,32 +5143,18 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
     }
 
     // Process Admin Nodes
-    const activeAdminNodes: any[] = [];
     for (const node of candidateAdminNodes) {
-      if (node.displayEndTime) {
-        const endMs = new Date(node.displayEndTime).getTime();
-        if (endMs <= nowMs) continue;
-      }
+      if (!node) continue;
       const nodeIdStr = node._id.toString();
       if (userPhone && (isOrderCancelledForUser(userPhone, nodeIdStr) || isOrderCancelledForUser(userPhone, node.claimedRptNo))) {
         continue;
       }
-      activeAdminNodes.push(node);
-    }
 
-    const hasActiveAdminOrders = activeAdminNodes.length > 0;
-    for (const node of activeAdminNodes) {
-      const rptNo = node.claimedRptNo || generate15DigitRptNo();
+      const rptNo = node.claimedRptNo || `ADM_${nodeIdStr.slice(-10)}`;
       const methodVal = node.type === 'upi' ? 1 : 2;
       const nodeCtType = reqCtType || 1;
       const nodeCtime = Math.floor(new Date(node.createdAt || Date.now()).getTime() / 1000);
-      let remainingSecs = node.displayDuration || 300;
-      let displayEndTimeIso = '';
-      if (node.displayEndTime) {
-        const endMs = new Date(node.displayEndTime).getTime();
-        remainingSecs = Math.max(0, Math.floor((endMs - nowMs) / 1000));
-        displayEndTimeIso = new Date(node.displayEndTime).toISOString();
-      }
+
       const slipItem: OrderSlipItem = {
         rptNo,
         amount: node.amount,
@@ -5183,7 +5165,7 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
         ctime: nodeCtime
       };
       (slipItem as any).isAdminNode = true;
-      (slipItem as any).nodeId = node._id.toString();
+      (slipItem as any).nodeId = nodeIdStr;
       orderSlipMap.set(rptNo, slipItem);
 
       list.push({
@@ -5204,11 +5186,9 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
         name: node.name,
         account_name: node.name,
         isAdminNode: true,
-        nodeId: node._id.toString(),
+        nodeId: nodeIdStr,
         ctime: nodeCtime,
-        displayEndTime: displayEndTimeIso,
-        remainingSeconds: remainingSecs,
-        displayDuration: node.displayDuration || 300
+        displayDuration: node.displayDuration || 86400
       });
     }
 
@@ -5224,105 +5204,103 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
       }
     }
 
-    // Process Sellers (Only if NO active admin panel order is live! If an admin order is live, hide P2P seller orders until claimed or expired)
-    if (!hasActiveAdminOrders) {
-      const lastAssignedSellerId = userIdStr ? buyerLastSellerMap.get(userIdStr) : "";
-      const sortedSellingUsers = [...sellingUsers].sort((a: any, b: any) => {
-        const boostA = a.sellBoost ? 1 : 0;
-        const boostB = b.sellBoost ? 1 : 0;
-        if (boostA !== boostB) return boostB - boostA;
-        if (lastAssignedSellerId) {
-          if (a._id.toString() === lastAssignedSellerId) return 1;
-          if (a._id.toString() === lastAssignedSellerId) return -1;
+    // Process Sellers
+    const lastAssignedSellerId = userIdStr ? buyerLastSellerMap.get(userIdStr) : "";
+    const sortedSellingUsers = [...sellingUsers].sort((a: any, b: any) => {
+      const boostA = a.sellBoost ? 1 : 0;
+      const boostB = b.sellBoost ? 1 : 0;
+      if (boostA !== boostB) return boostB - boostA;
+      if (lastAssignedSellerId) {
+        if (a._id.toString() === lastAssignedSellerId) return 1;
+        if (b._id.toString() === lastAssignedSellerId) return -1;
+      }
+      return 0;
+    });
+
+    for (const seller of sortedSellingUsers) {
+      const sId = seller._id.toString();
+      const sPhone = seller.phone || "";
+      if (currentUser && (sId === userIdStr || sPhone === userPhone)) continue;
+      if (frozenSellers.has(sId) || frozenSellers.has(sPhone)) continue;
+
+      const tools = seller.collectionTools || [];
+      const activeTools = tools.filter((t: any) =>
+        t &&
+        (t.state === 2 || t.state === '2' || t.status === 1) &&
+        (Number(t.inSell) === 1 || t.inSell === true || t.inSell === "1") &&
+        t.upi &&
+        t.upi.includes('@') &&
+        t.upi !== 'Pending verification' &&
+        !buyerUpiList.includes(String(t.upi).toLowerCase().trim())
+      );
+
+      if (activeTools.length > 0) {
+        const primaryTool = (reqCtType !== undefined ? activeTools.find((t: any) => t.type === reqCtType || t.ctType === reqCtType || t.ct_type === reqCtType) : undefined) || activeTools[0];
+        const upiId = primaryTool.upi || (primaryTool.backup_upi && primaryTool.backup_upi[0]);
+        if (!upiId || !upiId.includes('@') || buyerUpiList.includes(String(upiId).toLowerCase().trim())) continue;
+
+        const toolCtType = primaryTool.ct_type || primaryTool.ctType || primaryTool.type || reqCtType || 1;
+        let partnerName = primaryTool.pnname || seller.fullName || seller.phone || "Merchant Partner";
+        if (["PayTM", "PhonePe", "MobiKwik", "Freecharge", "Airtel Pay", "BharatPe", "Merchant Partner", "PayTM Business", "PhonePe Business"].includes(partnerName)) {
+          partnerName = seller.phone || "Merchant Partner";
         }
-        return 0;
-      });
 
-      for (const seller of sortedSellingUsers) {
-        const sId = seller._id.toString();
-        const sPhone = seller.phone || "";
-        if (currentUser && (sId === userIdStr || sPhone === userPhone)) continue;
-        if (frozenSellers.has(sId) || frozenSellers.has(sPhone)) continue;
+        const isBank = (primaryTool.type === 2 || primaryTool.type === 4 || primaryTool.type === 8);
+        const methodVal = isBank ? 2 : 1;
 
-        const tools = seller.collectionTools || [];
-        const activeTools = tools.filter((t: any) =>
-          t &&
-          (t.state === 2 || t.state === '2' || t.status === 1) &&
-          (Number(t.inSell) === 1 || t.inSell === true || t.inSell === "1") &&
-          t.upi &&
-          t.upi.includes('@') &&
-          t.upi !== 'Pending verification' &&
-          !buyerUpiList.includes(String(t.upi).toLowerCase().trim())
-        );
+        const pendingSum = (sellerPendingMap.get(sId) || 0) + (sellerPendingMap.get(sPhone) || 0);
+        const availableBalance = Math.max(0, (seller.balance || 0) - pendingSum);
+        if (availableBalance < 100) continue; // Minimum valid 100 sell amount required
 
-        if (activeTools.length > 0) {
-          const primaryTool = (reqCtType !== undefined ? activeTools.find((t: any) => t.type === reqCtType || t.ctType === reqCtType || t.ct_type === reqCtType) : undefined) || activeTools[0];
-          const upiId = primaryTool.upi || (primaryTool.backup_upi && primaryTool.backup_upi[0]);
-          if (!upiId || !upiId.includes('@') || buyerUpiList.includes(String(upiId).toLowerCase().trim())) continue;
+        const baseChunks = generateOrderChunks(availableBalance, reqAmtParam);
+        let combinedAmounts = baseChunks;
+        if (minAmt !== undefined || maxAmt !== undefined) {
+          const lower = minAmt !== undefined ? minAmt : 100;
+          const upper = maxAmt !== undefined ? maxAmt : 99999999;
+          combinedAmounts = combinedAmounts.filter(a => a >= lower && a <= upper);
+        }
 
-          const toolCtType = primaryTool.ct_type || primaryTool.ctType || primaryTool.type || reqCtType || 1;
-          let partnerName = primaryTool.pnname || seller.fullName || seller.phone || "Merchant Partner";
-          if (["PayTM", "PhonePe", "MobiKwik", "Freecharge", "Airtel Pay", "BharatPe", "Merchant Partner", "PayTM Business", "PhonePe Business"].includes(partnerName)) {
-            partnerName = seller.phone || "Merchant Partner";
-          }
+        combinedAmounts.forEach((amt) => {
+          if (amt < 100) return;
+          const rptNo = generate15DigitRptNo();
+          if (userPhone && isOrderCancelledForUser(userPhone, rptNo)) return;
 
-          const isBank = (primaryTool.type === 2 || primaryTool.type === 4 || primaryTool.type === 8);
-          const methodVal = isBank ? 2 : 1;
+          const slipItem: OrderSlipItem = {
+            rptNo,
+            sellerId: sId,
+            sellerPhone: sPhone,
+            ctId: primaryTool.id,
+            ctType: toolCtType,
+            amount: amt,
+            method: methodVal,
+            upi: upiId,
+            pnname: partnerName,
+            ctime: Math.floor(Date.now() / 1000)
+          };
+          orderSlipMap.set(rptNo, slipItem);
 
-          const pendingSum = (sellerPendingMap.get(sId) || 0) + (sellerPendingMap.get(sPhone) || 0);
-          const availableBalance = Math.max(0, (seller.balance || 0) - pendingSum);
-          if (availableBalance < 100) continue; // Minimum valid 100 sell amount required
-
-          const baseChunks = generateOrderChunks(availableBalance, reqAmtParam);
-          let combinedAmounts = baseChunks;
-          if (minAmt !== undefined || maxAmt !== undefined) {
-            const lower = minAmt !== undefined ? minAmt : 100;
-            const upper = maxAmt !== undefined ? maxAmt : 99999999;
-            combinedAmounts = combinedAmounts.filter(a => a >= lower && a <= upper);
-          }
-
-          combinedAmounts.forEach((amt) => {
-            if (amt < 100) return;
-            const rptNo = generate15DigitRptNo();
-            if (userPhone && isOrderCancelledForUser(userPhone, rptNo)) return;
-
-            const slipItem: OrderSlipItem = {
-              rptNo,
-              sellerId: sId,
-              sellerPhone: sPhone,
-              ctId: primaryTool.id,
-              ctType: toolCtType,
-              amount: amt,
-              method: methodVal,
-              upi: upiId,
-              pnname: partnerName,
-              ctime: Math.floor(Date.now() / 1000)
-            };
-            orderSlipMap.set(rptNo, slipItem);
-
-            list.push({
-              rptNo,
-              amount: amt.toString(),
-              method: methodVal,
-              payment_method: methodVal,
-              upi: upiId,
-              account: upiId,
-              ctAccount: upiId,
-              pnaccount: upiId,
-              accountNumber: upiId,
-              payAccount: upiId,
-              acctNo: upiId,
-              pnname: partnerName,
-              name: partnerName,
-              account_name: partnerName,
-              ctType: toolCtType,
-              ct_type: toolCtType,
-              sellerPhone: sPhone,
-              sellerId: sId,
-              ctId: primaryTool.id
-            });
+          list.push({
+            rptNo,
+            amount: amt.toString(),
+            method: methodVal,
+            payment_method: methodVal,
+            upi: upiId,
+            account: upiId,
+            ctAccount: upiId,
+            pnaccount: upiId,
+            accountNumber: upiId,
+            payAccount: upiId,
+            acctNo: upiId,
+            pnname: partnerName,
+            name: partnerName,
+            account_name: partnerName,
+            ctType: toolCtType,
+            ct_type: toolCtType,
+            sellerPhone: sPhone,
+            sellerId: sId,
+            ctId: primaryTool.id
           });
-        }
+        });
       }
     }
 
@@ -8615,18 +8593,6 @@ async function runAutonomousBackgroundWorker() {
         console.error(`[BACKGROUND WORKER] Error crediting uncredited order ${uTx.rptNo}:`, err);
       }
     }
-
-    // 3. Auto-expire outdated payment nodes whose displayEndTime has passed
-    const now = new Date();
-    await PaymentNode.updateMany(
-      {
-        orderState: 'ACTIVE',
-        displayEndTime: { $lte: now }
-      },
-      {
-        $set: { orderState: 'EXPIRED' }
-      }
-    ).catch(() => {});
 
   } catch (err) {
     console.error('[AUTONOMOUS BACKGROUND WORKER ERROR]', err);
