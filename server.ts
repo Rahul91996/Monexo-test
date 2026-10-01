@@ -5117,13 +5117,7 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
     // 1. Fetch DB data reliably
     const [candidateAdminNodes, sellingUsers, allPendingTxs, sellerDelays] = await Promise.all([
       PaymentNode.find({
-        status: true,
-        $or: [
-          { orderState: 'ACTIVE' },
-          { orderState: { $exists: false } },
-          { orderState: null },
-          { orderState: '' }
-        ]
+        $or: [{ status: true }, { status: 1 }, { status: 'true' }]
       }).sort({ createdAt: -1 }).lean(),
       User.find({ balance: { $gte: 100 }, status: { $nin: ['disabled', 'suspended'] } }).lean(),
       Transaction.find({ payer_status: { $in: [1, 2] } }).lean(),
@@ -12946,7 +12940,7 @@ app.put('/xxapi/admin/nodes/:id', requireAdmin, async (req, res) => {
     if (amount !== undefined) node.amount = Number(amount);
     if (status !== undefined) node.status = Boolean(status);
     if (displayDuration !== undefined) node.displayDuration = Number(displayDuration);
-    if (resetTimer || (status === true && node.orderState === 'EXPIRED')) {
+    if (status === true || resetTimer || (node.status === true && node.orderState !== 'ACTIVE')) {
       const dur = Number(displayDuration) || node.displayDuration || 300;
       node.displayEndTime = new Date(Date.now() + dur * 1000);
       node.orderState = 'ACTIVE';
