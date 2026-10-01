@@ -5132,9 +5132,24 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
     // Process Admin Nodes (Only show ACTIVE non-claimed nodes)
     for (const node of candidateAdminNodes) {
       if (!node || node.status === false) continue;
-      if (node.claimedByPhone) continue; // Do NOT show nodes that are already claimed by a buyer
+
+      // 1. Skip if orderState is NOT ACTIVE (i.e. CLAIMED, COMPLETED, CANCELLED, or EXPIRED)
+      if (node.orderState && node.orderState !== 'ACTIVE') continue;
+
+      // 2. Skip if already claimed by a buyer phone or has a claimed RPT number
+      if (node.claimedByPhone || node.claimedRptNo) continue;
 
       const nodeIdStr = node._id.toString();
+
+      // 3. Skip if a transaction already exists in DB for this node
+      const isClaimedInDb = await Transaction.exists({
+        $or: [
+          { payee_bank_account: node.accountNumber, amount: node.amount, payer_status: { $in: [1, 2, 3] } },
+          { _id: isValidObjectId(node.claimedRptNo) ? node.claimedRptNo : null }
+        ].filter(Boolean)
+      }).catch(() => false);
+      if (isClaimedInDb) continue;
+
       if (userPhone && (isOrderCancelledForUser(userPhone, nodeIdStr) || isOrderCancelledForUser(userPhone, node.claimedRptNo))) {
         continue;
       }
