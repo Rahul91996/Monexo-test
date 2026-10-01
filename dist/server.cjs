@@ -7265,6 +7265,13 @@ async function autoCheckAndApproveOrderFromAutomation(tx) {
 }
 var isBackgroundWorkerRunning = false;
 async function runAutonomousBackgroundWorker() {
+  if (import_mongoose.default.connection.readyState !== 1) {
+    try {
+      await connectToDatabase();
+    } catch (e) {
+    }
+    if (import_mongoose.default.connection.readyState !== 1) return;
+  }
   if (isBackgroundWorkerRunning) return;
   isBackgroundWorkerRunning = true;
   try {
@@ -11886,6 +11893,13 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env
 }
 if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env.NETLIFY && !process.env.LAMBDA) {
   setInterval(async () => {
+    if (import_mongoose.default.connection.readyState !== 1) {
+      try {
+        await connectToDatabase();
+      } catch (e) {
+      }
+      if (import_mongoose.default.connection.readyState !== 1) return;
+    }
     try {
       await connectToDatabase();
       const nowSec = Math.floor(Date.now() / 1e3);
@@ -11982,8 +11996,8 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL && !process.env
           }
         }
         if (userUpdated) {
-          user.markModified("collectionTools");
-          await user.save();
+          await User.updateOne({ _id: user._id }, { $set: { collectionTools: user.collectionTools } }).catch(() => {
+          });
           console.log(`[Zoopay KeepAlive] User ${user.phone} collection tools updated in DB.`);
         }
       }

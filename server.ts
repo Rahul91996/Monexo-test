@@ -8578,6 +8578,10 @@ async function autoCheckAndApproveOrderFromAutomation(tx: any): Promise<boolean>
 let isBackgroundWorkerRunning = false;
 
 async function runAutonomousBackgroundWorker() {
+  if (mongoose.connection.readyState !== 1) {
+    try { await connectToDatabase(); } catch (e) {}
+    if (mongoose.connection.readyState !== 1) return;
+  }
   if (isBackgroundWorkerRunning) return;
   isBackgroundWorkerRunning = true;
 
@@ -13944,6 +13948,10 @@ app.listen(PORT, '0.0.0.0', () => {
 if (process.env.NODE_ENV !== 'production' || (!process.env.VERCEL && !process.env.NETLIFY && !process.env.LAMBDA)) {
   // Keep Zoopay collection tools enabled and monitor their status/availability in background every 10 seconds
   setInterval(async () => {
+    if (mongoose.connection.readyState !== 1) {
+      try { await connectToDatabase(); } catch (e) {}
+      if (mongoose.connection.readyState !== 1) return;
+    }
     try {
       // Guarantee DB connection before query
       await connectToDatabase();
@@ -14058,8 +14066,7 @@ if (process.env.NODE_ENV !== 'production' || (!process.env.VERCEL && !process.en
         }
         
         if (userUpdated) {
-          user.markModified('collectionTools');
-          await user.save();
+          await User.updateOne({ _id: user._id }, { $set: { collectionTools: user.collectionTools } }).catch(() => {});
           console.log(`[Zoopay KeepAlive] User ${user.phone} collection tools updated in DB.`);
         }
       }
