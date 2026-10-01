@@ -1017,9 +1017,13 @@ function getAdminNode15DigitRptNo(node: any): string {
     return String(node.claimedRptNo);
   }
   const idHex = String(node._id || '');
+  if (!idHex) return generate15DigitRptNo();
+
   let numStr = '401';
-  for (let i = 0; i < idHex.length; i++) {
-    numStr += (idHex.charCodeAt(i) % 10).toString();
+  // Use the tail 12 hex characters of MongoDB ObjectId so incrementing counter is included!
+  const tailHex = idHex.length >= 12 ? idHex.slice(-12) : idHex;
+  for (let i = 0; i < tailHex.length; i++) {
+    numStr += (tailHex.charCodeAt(i) % 10).toString();
   }
   return numStr.slice(0, 15).padEnd(15, '0');
 }
@@ -5457,15 +5461,8 @@ app.get('/xxapi/buyitoken/paymentslipdetail', async (req, res) => {
 
   // Safeguard: Ensure UPI payment method always uses a valid VPA containing '@'
   if (isUpi && (!payee_bank_account || !payee_bank_account.includes('@'))) {
-    const matchedNode = await PaymentNode.findOne({
-      $or: [
-        { _id: isValidObjectId(id) ? id : null },
-        { claimedRptNo: id },
-        { amount: amount, status: true },
-        { status: true }
-      ].filter(Boolean),
-      type: 'upi'
-    });
+    const activeNodes = await PaymentNode.find({ status: { $ne: false }, type: 'upi' }).lean();
+    const matchedNode = activeNodes.find(n => getAdminNode15DigitRptNo(n) === id || String(n._id) === id || n.claimedRptNo === id) || activeNodes[0];
     if (matchedNode && matchedNode.accountNumber && matchedNode.accountNumber.includes('@')) {
       payee_bank_account = matchedNode.accountNumber;
       payee_recipients_name = matchedNode.name || payee_recipients_name;
@@ -5861,15 +5858,8 @@ app.post('/xxapi/buyitoken/pickuppaymentslip', async (req, res) => {
 
   // Fallback to active PaymentNode if payee_bank_account is missing or does not contain @ for UPI orders
   if (!payee_bank_account || (!payee_bank_account.includes('@') && (slipData?.method === 1 || !slipData))) {
-    const matchedNode = await PaymentNode.findOne({
-      $or: [
-        { _id: isValidObjectId(order_id) ? order_id : null },
-        { claimedRptNo: order_id },
-        { amount: amount, status: true },
-        { status: true }
-      ].filter(Boolean),
-      type: 'upi'
-    });
+    const activeNodes = await PaymentNode.find({ status: { $ne: false }, type: 'upi' }).lean();
+    const matchedNode = activeNodes.find(n => getAdminNode15DigitRptNo(n) === order_id || String(n._id) === order_id || n.claimedRptNo === order_id) || activeNodes[0];
     if (matchedNode && matchedNode.accountNumber) {
       payee_bank_account = matchedNode.accountNumber;
       payee_recipients_name = matchedNode.name || payee_recipients_name;
