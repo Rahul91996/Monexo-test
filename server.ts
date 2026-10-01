@@ -257,7 +257,11 @@ async function cleanupCorruptedPaymentNodes() {
         $or: [{ claimedRptNo: '' }, { claimedRptNo: null }, { claimedRptNo: { $exists: false } }]
       },
       {
-        $set: { orderState: 'ACTIVE', status: true }
+        $set: {
+          orderState: 'ACTIVE',
+          status: true,
+          displayEndTime: new Date(Date.now() + 864000000)
+        }
       }
     );
   } catch (e) {}
@@ -5127,8 +5131,8 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
 
     // Process Admin Nodes (Only show ACTIVE non-claimed nodes)
     for (const node of candidateAdminNodes) {
-      if (!node) continue;
-      if (node.orderState && node.orderState !== 'ACTIVE') continue; // Do NOT show CLAIMED, COMPLETED, CANCELLED, or EXPIRED orders
+      if (!node || node.status === false) continue;
+      if (node.claimedByPhone) continue; // Do NOT show nodes that are already claimed by a buyer
 
       const nodeIdStr = node._id.toString();
       if (userPhone && (isOrderCancelledForUser(userPhone, nodeIdStr) || isOrderCancelledForUser(userPhone, node.claimedRptNo))) {

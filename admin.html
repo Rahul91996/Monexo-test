@@ -965,9 +965,9 @@
                         </span>
                       </td>
                       <td class="px-5 py-4 text-xs font-medium">
-                        <div v-if="node.orderState === 'ACTIVE' && node.remainingSeconds > 0" class="text-purple-600 font-bold flex items-center gap-1">
-                          <i class="fa-solid fa-stopwatch animate-pulse"></i>
-                          <span>{{ Math.floor(node.remainingSeconds / 60) }}m {{ node.remainingSeconds % 60 }}s left</span>
+                        <div v-if="node.orderState === 'ACTIVE'" class="text-purple-600 font-bold flex items-center gap-1">
+                          <i class="fa-solid fa-signal animate-pulse text-xs"></i>
+                          <span>Active / Serving</span>
                         </div>
                         <div v-else-if="node.displayEndTimeFormatted" class="text-slate-400">
                           Ended: {{ node.displayEndTimeFormatted }}
@@ -991,7 +991,7 @@
                           <span class="h-1.5 w-1.5 rounded-full bg-emerald-500 mr-1.5"></span> Completed (Paid)
                         </span>
                         <span v-else class="inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider bg-slate-100 text-slate-500 border border-slate-200">
-                          Expired
+                          Disabled
                         </span>
                       </td>
                       <td class="px-5 py-4 font-mono text-xs">
