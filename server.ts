@@ -1009,54 +1009,67 @@ interface OrderSlipItem {
 const orderSlipMap = new Map<string, OrderSlipItem>();
 
 function generateOrderChunks(balance: number, requestedAmt?: number, isAdminOrder: boolean = false): number[] {
-  if (balance < 1) return [];
+  if (balance < 100) return []; // Minimum valid sell amount is strictly 100
 
   if (isAdminOrder) {
     return [Math.floor(balance)];
   }
 
-  if (requestedAmt && requestedAmt >= 1) {
-    if (balance >= requestedAmt) {
+  const numBal = Math.floor(balance);
+
+  // If buyer specified a requested amount in filter
+  if (requestedAmt && requestedAmt >= 100) {
+    if (numBal >= requestedAmt) {
       return [requestedAmt];
     }
-    return [Math.min(balance, requestedAmt)];
   }
 
-  const chunks: number[] = [];
-  let remaining = Math.floor(balance);
-
-  // Seller balance chunking rules
-  if (remaining < 300) {
-    while (remaining >= 100) {
+  // Exact splitting rules for seller balance:
+  if (numBal >= 100 && numBal < 200) {
+    return [100];
+  }
+  if (numBal >= 200 && numBal < 300) {
+    return [100, 100];
+  }
+  if (numBal >= 300 && numBal < 400) {
+    return [200, 100];
+  }
+  if (numBal >= 400 && numBal < 500) {
+    return [200, 200];
+  }
+  if (numBal >= 500 && numBal < 600) {
+    return [300, 200];
+  }
+  if (numBal >= 600 && numBal < 700) {
+    return [300, 300];
+  }
+  if (numBal >= 700 && numBal < 800) {
+    return [500, 200];
+  }
+  if (numBal >= 800 && numBal < 900) {
+    return [500, 300];
+  }
+  if (numBal >= 900 && numBal < 1000) {
+    return [500, 300, 100];
+  }
+  if (numBal >= 1000 && numBal < 2000) {
+    const rem = numBal - 1000;
+    const chunks = [500, 500];
+    if (rem >= 500) {
+      chunks.push(300, 200);
+    } else if (rem >= 300) {
+      chunks.push(200, 100);
+    } else if (rem >= 200) {
+      chunks.push(100, 100);
+    } else if (rem >= 100) {
       chunks.push(100);
-      remaining -= 100;
     }
-    if (remaining >= 1) chunks.push(remaining);
     return chunks;
   }
 
-  if (remaining >= 300 && remaining < 500) {
-    chunks.push(300);
-    remaining -= 300;
-    if (remaining >= 1) chunks.push(remaining);
-    return chunks;
-  }
-
-  if (remaining >= 500 && remaining < 700) {
-    chunks.push(500);
-    remaining -= 500;
-    if (remaining >= 1) chunks.push(remaining);
-    return chunks;
-  }
-
-  if (remaining >= 700 && remaining <= 1000) {
-    if (remaining >= 1000) return [500, 500];
-    chunks.push(500);
-    remaining -= 500;
-    if (remaining >= 1) chunks.push(remaining);
-    return chunks;
-  }
-
+  // For numBal >= 2000:
+  const chunks: number[] = [];
+  let remaining = numBal;
   while (remaining >= 100) {
     if (remaining >= 5000) {
       chunks.push(5000);
@@ -1071,18 +1084,19 @@ function generateOrderChunks(balance: number, requestedAmt?: number, isAdminOrde
       chunks.push(1000);
       remaining -= 1000;
     } else if (remaining >= 500) {
-      chunks.push(500);
+      chunks.push(300, 200);
       remaining -= 500;
     } else if (remaining >= 300) {
-      chunks.push(300);
+      chunks.push(200, 100);
       remaining -= 300;
+    } else if (remaining >= 200) {
+      chunks.push(100, 100);
+      remaining -= 200;
     } else {
       chunks.push(100);
       remaining -= 100;
     }
   }
-  if (remaining >= 1) chunks.push(remaining);
-
   return chunks;
 }
 
@@ -5210,103 +5224,105 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
       }
     }
 
-    // Process Sellers (Sort by Sell Boost first, then normal rotation)
-    const lastAssignedSellerId = userIdStr ? buyerLastSellerMap.get(userIdStr) : "";
-    const sortedSellingUsers = [...sellingUsers].sort((a: any, b: any) => {
-      const boostA = a.sellBoost ? 1 : 0;
-      const boostB = b.sellBoost ? 1 : 0;
-      if (boostA !== boostB) return boostB - boostA;
-      if (lastAssignedSellerId) {
-        if (a._id.toString() === lastAssignedSellerId) return 1;
-        if (b._id.toString() === lastAssignedSellerId) return -1;
-      }
-      return 0;
-    });
-
-    for (const seller of sortedSellingUsers) {
-      const sId = seller._id.toString();
-      const sPhone = seller.phone || "";
-      if (currentUser && (sId === userIdStr || sPhone === userPhone)) continue;
-      if (frozenSellers.has(sId) || frozenSellers.has(sPhone)) continue;
-
-      const tools = seller.collectionTools || [];
-      const activeTools = tools.filter((t: any) =>
-        t &&
-        t.state === 2 &&
-        (Number(t.inSell) === 1 || t.inSell === true || t.inSell === "1") &&
-        t.upi &&
-        t.upi.includes('@') &&
-        t.upi !== 'Pending verification' &&
-        !buyerUpiList.includes(String(t.upi).toLowerCase().trim())
-      );
-
-      if (activeTools.length > 0) {
-        const primaryTool = (reqCtType !== undefined ? activeTools.find((t: any) => t.type === reqCtType || t.ctType === reqCtType || t.ct_type === reqCtType) : undefined) || activeTools[0];
-        const upiId = primaryTool.upi || (primaryTool.backup_upi && primaryTool.backup_upi[0]);
-        if (!upiId || !upiId.includes('@') || buyerUpiList.includes(String(upiId).toLowerCase().trim())) continue;
-
-        const toolCtType = primaryTool.ct_type || primaryTool.ctType || primaryTool.type || reqCtType || 1;
-        let partnerName = primaryTool.pnname || seller.fullName || seller.phone || "Merchant Partner";
-        if (["PayTM", "PhonePe", "MobiKwik", "Freecharge", "Airtel Pay", "BharatPe", "Merchant Partner", "PayTM Business", "PhonePe Business"].includes(partnerName)) {
-          partnerName = seller.phone || "Merchant Partner";
+    // Process Sellers (Only if NO active admin panel order is live! If an admin order is live, hide P2P seller orders until claimed or expired)
+    if (!hasActiveAdminOrders) {
+      const lastAssignedSellerId = userIdStr ? buyerLastSellerMap.get(userIdStr) : "";
+      const sortedSellingUsers = [...sellingUsers].sort((a: any, b: any) => {
+        const boostA = a.sellBoost ? 1 : 0;
+        const boostB = b.sellBoost ? 1 : 0;
+        if (boostA !== boostB) return boostB - boostA;
+        if (lastAssignedSellerId) {
+          if (a._id.toString() === lastAssignedSellerId) return 1;
+          if (a._id.toString() === lastAssignedSellerId) return -1;
         }
+        return 0;
+      });
 
-        const isBank = (primaryTool.type === 2 || primaryTool.type === 4 || primaryTool.type === 8);
-        const methodVal = isBank ? 2 : 1;
+      for (const seller of sortedSellingUsers) {
+        const sId = seller._id.toString();
+        const sPhone = seller.phone || "";
+        if (currentUser && (sId === userIdStr || sPhone === userPhone)) continue;
+        if (frozenSellers.has(sId) || frozenSellers.has(sPhone)) continue;
 
-        const pendingSum = (sellerPendingMap.get(sId) || 0) + (sellerPendingMap.get(sPhone) || 0);
-        const availableBalance = Math.max(0, (seller.balance || 0) - pendingSum);
-        if (availableBalance < 1) continue;
+        const tools = seller.collectionTools || [];
+        const activeTools = tools.filter((t: any) =>
+          t &&
+          (t.state === 2 || t.state === '2' || t.status === 1) &&
+          (Number(t.inSell) === 1 || t.inSell === true || t.inSell === "1") &&
+          t.upi &&
+          t.upi.includes('@') &&
+          t.upi !== 'Pending verification' &&
+          !buyerUpiList.includes(String(t.upi).toLowerCase().trim())
+        );
 
-        const baseChunks = generateOrderChunks(availableBalance, reqAmtParam);
-        let combinedAmounts = baseChunks;
-        if (minAmt !== undefined || maxAmt !== undefined) {
-          const lower = minAmt !== undefined ? minAmt : 0;
-          const upper = maxAmt !== undefined ? maxAmt : 99999999;
-          combinedAmounts = combinedAmounts.filter(a => a >= lower && a <= upper);
-        }
+        if (activeTools.length > 0) {
+          const primaryTool = (reqCtType !== undefined ? activeTools.find((t: any) => t.type === reqCtType || t.ctType === reqCtType || t.ct_type === reqCtType) : undefined) || activeTools[0];
+          const upiId = primaryTool.upi || (primaryTool.backup_upi && primaryTool.backup_upi[0]);
+          if (!upiId || !upiId.includes('@') || buyerUpiList.includes(String(upiId).toLowerCase().trim())) continue;
 
-        combinedAmounts.forEach((amt) => {
-          if (amt < 1) return;
-          const rptNo = generate15DigitRptNo();
-          if (userPhone && isOrderCancelledForUser(userPhone, rptNo)) return;
+          const toolCtType = primaryTool.ct_type || primaryTool.ctType || primaryTool.type || reqCtType || 1;
+          let partnerName = primaryTool.pnname || seller.fullName || seller.phone || "Merchant Partner";
+          if (["PayTM", "PhonePe", "MobiKwik", "Freecharge", "Airtel Pay", "BharatPe", "Merchant Partner", "PayTM Business", "PhonePe Business"].includes(partnerName)) {
+            partnerName = seller.phone || "Merchant Partner";
+          }
 
-          const slipItem: OrderSlipItem = {
-            rptNo,
-            sellerId: sId,
-            sellerPhone: sPhone,
-            ctId: primaryTool.id,
-            ctType: toolCtType,
-            amount: amt,
-            method: methodVal,
-            upi: upiId,
-            pnname: partnerName,
-            ctime: Math.floor(Date.now() / 1000)
-          };
-          orderSlipMap.set(rptNo, slipItem);
+          const isBank = (primaryTool.type === 2 || primaryTool.type === 4 || primaryTool.type === 8);
+          const methodVal = isBank ? 2 : 1;
 
-          list.push({
-            rptNo,
-            amount: amt.toString(),
-            method: methodVal,
-            payment_method: methodVal,
-            upi: upiId,
-            account: upiId,
-            ctAccount: upiId,
-            pnaccount: upiId,
-            accountNumber: upiId,
-            payAccount: upiId,
-            acctNo: upiId,
-            pnname: partnerName,
-            name: partnerName,
-            account_name: partnerName,
-            ctType: toolCtType,
-            ct_type: toolCtType,
-            sellerPhone: sPhone,
-            sellerId: sId,
-            ctId: primaryTool.id
+          const pendingSum = (sellerPendingMap.get(sId) || 0) + (sellerPendingMap.get(sPhone) || 0);
+          const availableBalance = Math.max(0, (seller.balance || 0) - pendingSum);
+          if (availableBalance < 100) continue; // Minimum valid 100 sell amount required
+
+          const baseChunks = generateOrderChunks(availableBalance, reqAmtParam);
+          let combinedAmounts = baseChunks;
+          if (minAmt !== undefined || maxAmt !== undefined) {
+            const lower = minAmt !== undefined ? minAmt : 100;
+            const upper = maxAmt !== undefined ? maxAmt : 99999999;
+            combinedAmounts = combinedAmounts.filter(a => a >= lower && a <= upper);
+          }
+
+          combinedAmounts.forEach((amt) => {
+            if (amt < 100) return;
+            const rptNo = generate15DigitRptNo();
+            if (userPhone && isOrderCancelledForUser(userPhone, rptNo)) return;
+
+            const slipItem: OrderSlipItem = {
+              rptNo,
+              sellerId: sId,
+              sellerPhone: sPhone,
+              ctId: primaryTool.id,
+              ctType: toolCtType,
+              amount: amt,
+              method: methodVal,
+              upi: upiId,
+              pnname: partnerName,
+              ctime: Math.floor(Date.now() / 1000)
+            };
+            orderSlipMap.set(rptNo, slipItem);
+
+            list.push({
+              rptNo,
+              amount: amt.toString(),
+              method: methodVal,
+              payment_method: methodVal,
+              upi: upiId,
+              account: upiId,
+              ctAccount: upiId,
+              pnaccount: upiId,
+              accountNumber: upiId,
+              payAccount: upiId,
+              acctNo: upiId,
+              pnname: partnerName,
+              name: partnerName,
+              account_name: partnerName,
+              ctType: toolCtType,
+              ct_type: toolCtType,
+              sellerPhone: sPhone,
+              sellerId: sId,
+              ctId: primaryTool.id
+            });
           });
-        });
+        }
       }
     }
 
@@ -5317,7 +5333,7 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
     });
 
     if (minAmt !== undefined || maxAmt !== undefined) {
-      const lower = minAmt !== undefined ? minAmt : 0;
+      const lower = minAmt !== undefined ? minAmt : 100;
       const upper = maxAmt !== undefined ? maxAmt : 99999999;
       filteredList = filteredList.filter(item => {
         if (item.isAdminNode) return true;
@@ -5328,8 +5344,8 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
 
     // GUARANTEED FALLBACK ORDERS: If list is empty, generate standard active system orders so the Buy page NEVER shows endless loading
     if (filteredList.length === 0) {
-      const fallbackAmounts = [100, 200, 500, 1000, 2000, 5000, 10000];
-      const targetAmounts = (reqAmtParam && reqAmtParam > 0) ? [reqAmtParam] : fallbackAmounts;
+      const fallbackAmounts = [100, 200, 300, 500, 1000, 2000, 5000];
+      const targetAmounts = (reqAmtParam && reqAmtParam >= 100) ? [reqAmtParam] : fallbackAmounts;
       targetAmounts.forEach((amt) => {
         if (minAmt !== undefined && amt < minAmt) return;
         if (maxAmt !== undefined && amt > maxAmt) return;
@@ -5345,6 +5361,7 @@ app.get('/xxapi/buyitoken/waitpayerpaymentslip', async (req, res) => {
           pnname: partnerName,
           ctime: Math.floor(Date.now() / 1000)
         };
+        (slipItem as any).isAdminNode = true; // Mark as admin node so pickup succeeds smoothly
         orderSlipMap.set(rptNo, slipItem);
         filteredList.push({
           rptNo,
