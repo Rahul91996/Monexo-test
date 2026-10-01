@@ -968,6 +968,13 @@ var paymentNodeSchema = new import_mongoose.default.Schema({
   utr: { type: String, default: "" },
   createdAt: { type: Date, default: Date.now }
 });
+var sellerDelaySchema = new import_mongoose.default.Schema({
+  sellerId: { type: String, index: true },
+  sellerPhone: { type: String, index: true },
+  unfreezeTime: { type: Date, index: true },
+  createdAt: { type: Date, default: Date.now }
+});
+var SellerDelay = import_mongoose.default.models.SellerDelay || import_mongoose.default.model("SellerDelay", sellerDelaySchema);
 var PaymentNode = import_mongoose.default.models.PaymentNode || import_mongoose.default.model("PaymentNode", paymentNodeSchema);
 function generateProviderId() {
   let id = "";

@@ -1088,6 +1088,15 @@ const paymentNodeSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
+
+const sellerDelaySchema = new mongoose.Schema({
+  sellerId: { type: String, index: true },
+  sellerPhone: { type: String, index: true },
+  unfreezeTime: { type: Date, index: true },
+  createdAt: { type: Date, default: Date.now }
+});
+const SellerDelay = mongoose.models.SellerDelay || mongoose.model('SellerDelay', sellerDelaySchema);
+
 const PaymentNode = mongoose.models.PaymentNode || mongoose.model('PaymentNode', paymentNodeSchema);
 
 // UNIQUE PROVIDER ID AND ALPHANUMERIC INVITE CODE HELPERS
