@@ -77,6 +77,19 @@ function getHtmlFilePath(filename) {
   return import_path.default.join(currentDirname, filename);
 }
 var app = (0, import_express.default)();
+app.get(["/health", "/api/health", "/favicon.ico", "/robots.txt"], (req, res) => {
+  if (req.path === "/favicon.ico") {
+    const iconPath = import_path.default.join(process.cwd(), "favicon.ico");
+    if (import_fs.default.existsSync(iconPath)) return res.sendFile(iconPath);
+    return res.status(204).end();
+  }
+  if (req.path === "/robots.txt") {
+    const robotsPath = import_path.default.join(process.cwd(), "robots.txt");
+    if (import_fs.default.existsSync(robotsPath)) return res.sendFile(robotsPath);
+    return res.type("text/plain").send("User-agent: *\nAllow: /");
+  }
+  return res.status(200).json({ status: "ok", time: (/* @__PURE__ */ new Date()).toISOString() });
+});
 app.get([
   "/privacy",
   "/privacypolicy",
@@ -212,7 +225,9 @@ async function connectToDatabase() {
     import_mongoose.default.set("bufferCommands", false);
     cachedDbPromise = import_mongoose.default.connect(MONGO_URI, {
       serverSelectionTimeoutMS: 5e3,
-      socketTimeoutMS: 1e4
+      connectTimeoutMS: 5e3,
+      socketTimeoutMS: 1e4,
+      family: 4
     }).then((conn) => {
       console.log("[Database] Successfully connected to MongoDB.");
       dropLegacyIndexes().catch(() => {
@@ -221,8 +236,8 @@ async function connectToDatabase() {
       return conn;
     }).catch((err) => {
       cachedDbPromise = null;
-      console.error("[Database] Connection failed:", err);
-      throw err;
+      console.error("[Database] Connection failed:", err?.message || err);
+      return null;
     });
   }
   return cachedDbPromise;
@@ -12885,6 +12900,8 @@ User Query: "${text}"`;
   }
 }
 async function startTelegramBotLoop() {
+  console.log("[Telegram Bot] Telegram bot polling disabled as requested.");
+  return;
   if (process.env.VERCEL || process.env.NETLIFY || process.env.LAMBDA || process.env.DISABLE_TELEGRAM_BOT === "true") {
     return;
   }

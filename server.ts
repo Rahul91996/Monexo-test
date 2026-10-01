@@ -54,6 +54,23 @@ function getHtmlFilePath(filename: string): string {
 
 const app = express();
 
+// Fast Railway Health Check & Static Metadata Routes (bypasses DB to prevent 502 Bad Gateway)
+app.get(['/health', '/api/health', '/favicon.ico', '/robots.txt'], (req, res) => {
+  if (req.path === '/favicon.ico') {
+    const iconPath = path.join(process.cwd(), 'favicon.ico');
+    if (fs.existsSync(iconPath)) return res.sendFile(iconPath);
+    return res.status(204).end();
+  }
+  if (req.path === '/robots.txt') {
+    const robotsPath = path.join(process.cwd(), 'robots.txt');
+    if (fs.existsSync(robotsPath)) return res.sendFile(robotsPath);
+    return res.type('text/plain').send('User-agent: *\nAllow: /');
+  }
+  return res.status(200).json({ status: 'ok', time: new Date().toISOString() });
+});
+
+
+
 // Serve Privacy Policy HTML
 app.get([
   "/privacy",
@@ -211,7 +228,9 @@ async function connectToDatabase() {
     
     cachedDbPromise = mongoose.connect(MONGO_URI, {
       serverSelectionTimeoutMS: 5000,
+      connectTimeoutMS: 5000,
       socketTimeoutMS: 10000,
+      family: 4
     }).then(conn => {
       console.log('[Database] Successfully connected to MongoDB.');
       dropLegacyIndexes().catch(() => {});
@@ -219,8 +238,8 @@ async function connectToDatabase() {
       return conn;
     }).catch(err => {
       cachedDbPromise = null; // Reset on failure so we retry next time
-      console.error('[Database] Connection failed:', err);
-      throw err;
+      console.error('[Database] Connection failed:', err?.message || err);
+      return null;
     });
   }
   
@@ -15107,6 +15126,9 @@ User Query: "${text}"`;
 }
 
 async function startTelegramBotLoop() {
+  console.log('[Telegram Bot] Telegram bot polling disabled as requested.');
+  return;
+
   if (process.env.VERCEL || process.env.NETLIFY || process.env.LAMBDA || process.env.DISABLE_TELEGRAM_BOT === 'true') {
     return;
   }
