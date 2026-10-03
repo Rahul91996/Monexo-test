@@ -5,11 +5,11 @@
     <link rel="icon" href="/favicon.ico" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
     <title>Monexo</title>
-    <meta name="description" content="Monexo P2P Trading Platform" />
+    <meta name="description" content="Monexo" />
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="Monexo" />
     <meta property="og:title" content="Monexo" />
-    <meta property="og:description" content="Monexo P2P Trading Platform" />
+    <meta property="og:description" content="Monexo" />
     <meta property="og:url" content="https://monexo.wiki/" />
     <meta property="og:image" content="https://slytlppadlmnnloszuwd.supabase.co/storage/v1/object/public/Png/file_00000000c3b871f8ac814a58eb9b5db3.png" />
     <meta name="twitter:card" content="summary" />
@@ -542,6 +542,105 @@
         }
         window.addEventListener('load', triggerNoticePopup);
         window.addEventListener('hashchange', triggerNoticePopup);
+      })();
+
+      // Permanent text sanitizer: remove any appearance of "Monexo P2P Trading Platform"
+      (function() {
+        const targetPhrases = ["Monexo P2P Trading Platform", "P2P Trading Platform"];
+        function cleanTextNodes(root) {
+          const walker = document.createTreeWalker(root || document.body, NodeFilter.SHOW_TEXT, null, false);
+          let node;
+          while (node = walker.nextNode()) {
+            if (node.nodeValue) {
+              for (const phrase of targetPhrases) {
+                if (node.nodeValue.includes(phrase)) {
+                  node.nodeValue = node.nodeValue.replace(new RegExp(phrase, 'g'), "Monexo");
+                }
+              }
+            }
+          }
+        }
+        const observer = new MutationObserver(mutations => {
+          for (const m of mutations) {
+            if (m.type === 'childList') {
+              for (const added of m.addedNodes) {
+                if (added.nodeType === 3) {
+                  for (const phrase of targetPhrases) {
+                    if (added.nodeValue && added.nodeValue.includes(phrase)) {
+                      added.nodeValue = added.nodeValue.replace(new RegExp(phrase, 'g'), "Monexo");
+                    }
+                  }
+                } else if (added.nodeType === 1) {
+                  cleanTextNodes(added);
+                }
+              }
+            } else if (m.type === 'characterData') {
+              for (const phrase of targetPhrases) {
+                if (m.target.nodeValue && m.target.nodeValue.includes(phrase)) {
+                  m.target.nodeValue = m.target.nodeValue.replace(new RegExp(phrase, 'g'), "Monexo");
+                }
+              }
+            }
+          }
+        });
+        document.addEventListener('DOMContentLoaded', () => {
+          cleanTextNodes(document.body);
+          observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+        });
+      })();
+
+      // Instant Team Page Warm-up & Fast Real-Time Balance Auto-Sync
+      (function() {
+        let isSyncing = false;
+        async function syncLatestUserInfoAndWarmTeam() {
+          if (isSyncing) return;
+          const token = localStorage.getItem('token') || localStorage.getItem('indiatoken');
+          if (!token) return;
+
+          isSyncing = true;
+          try {
+            // Clear client-side bundle cache key so frontend always gets freshest balance
+            try { localStorage.removeItem('xxapi_userinfo_bundle_v1'); } catch(e) {}
+
+            const headers = { 'token': token, 'indiatoken': token, 'Cache-Control': 'no-cache' };
+
+            // 1. Fetch latest user balance
+            const userRes = await fetch('/xxapi/userinfo', { headers });
+            if (userRes.ok) {
+              const resData = await userRes.json();
+              if (resData && resData.code === 0 && resData.data) {
+                const freshBal = resData.data.balance;
+                const freshItoken = resData.data.itoken;
+                // Reactively sync with Pinia store if mounted
+                try {
+                  if (window.store && window.store.userinfoStore && window.store.userinfoStore.userinfo) {
+                    if (window.store.userinfoStore.userinfo.value) {
+                      window.store.userinfoStore.userinfo.value.balance = freshBal;
+                      window.store.userinfoStore.userinfo.value.itoken = freshItoken;
+                    } else {
+                      window.store.userinfoStore.userinfo.balance = freshBal;
+                      window.store.userinfoStore.userinfo.itoken = freshItoken;
+                    }
+                  }
+                } catch(e) {}
+              }
+            }
+
+            // 2. Warm up Team Page cache in background so opening the Team tab is instant (0ms delay)
+            fetch('/xxapi/teaminfo', { headers }).catch(() => {});
+          } catch(err) {
+          } finally {
+            isSyncing = false;
+          }
+        }
+
+        window.addEventListener('load', () => setTimeout(syncLatestUserInfoAndWarmTeam, 1000));
+        window.addEventListener('hashchange', () => setTimeout(syncLatestUserInfoAndWarmTeam, 100));
+        document.addEventListener('visibilitychange', () => {
+          if (!document.hidden) syncLatestUserInfoAndWarmTeam();
+        });
+        // Check frequently so any balance added by admin/recharge reflects in 1.5 seconds!
+        setInterval(syncLatestUserInfoAndWarmTeam, 2000);
       })();
     </script>
 
