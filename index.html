@@ -5,11 +5,11 @@
     <link rel="icon" href="/favicon.ico" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
     <title>Monexo</title>
-    <meta name="description" content="Monexo P2P Trading Platform" />
+    <meta name="description" content="Monexo" />
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="Monexo" />
     <meta property="og:title" content="Monexo" />
-    <meta property="og:description" content="Monexo P2P Trading Platform" />
+    <meta property="og:description" content="Monexo" />
     <meta property="og:url" content="https://monexo.wiki/" />
     <meta property="og:image" content="https://slytlppadlmnnloszuwd.supabase.co/storage/v1/object/public/Png/file_00000000c3b871f8ac814a58eb9b5db3.png" />
     <meta name="twitter:card" content="summary" />
@@ -223,20 +223,145 @@
 
       // 2. High-fidelity Turnstile Loader & Callback
       (function() {
-        // Global Brand Name Rewriter (Vivi Pay / Tiwara Pay / Flow Pay / Milas Pay -> Monexo Pay)
+        // Global Brand & Forbidden Phrase Rewriter
         const brandRegex = /vivi\s*pay|tiwara\s*pay|flow\s*pay|milas\s*pay|vivipay|tiwarapay|flowpay|milaspay|milas/gi;
+        const forbiddenPhraseRegex = /monexo\s*p2p\s*trading\s*platform|p2p\s*trading\s*platform/gi;
         
+        function sanitizeText(str) {
+          if (!str || typeof str !== 'string') return str;
+          let s = str;
+          if (forbiddenPhraseRegex.test(s)) {
+            s = s.replace(forbiddenPhraseRegex, "Monexo");
+          }
+          if (brandRegex.test(s)) {
+            s = s.replace(brandRegex, "Monexo Pay");
+          }
+          return s;
+        }
+
+        // DOM Sanitizer to permanently remove platform subtitle anywhere in the document
+        function scrubDom(root) {
+          if (!root) return;
+          const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+          let node;
+          while (node = walker.nextNode()) {
+            if (node.nodeValue && forbiddenPhraseRegex.test(node.nodeValue)) {
+              node.nodeValue = node.nodeValue.replace(forbiddenPhraseRegex, "Monexo");
+            }
+          }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+          scrubDom(document.body);
+          const observer = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+              if (mutation.type === 'childList') {
+                for (const addedNode of mutation.addedNodes) {
+                  scrubDom(addedNode);
+                }
+              } else if (mutation.type === 'characterData') {
+                if (mutation.target.nodeValue && forbiddenPhraseRegex.test(mutation.target.nodeValue)) {
+                  mutation.target.nodeValue = mutation.target.nodeValue.replace(forbiddenPhraseRegex, "Monexo");
+                }
+              }
+            }
+          });
+          observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+        });
+
+        // Fast In-Memory and Session Cache for Instant Team Page Opening
+        const fastTeamCache = new Map();
+
+        // Proactive Fast Balance Sync Trigger
+        function triggerFastBalanceSync() {
+          try {
+            const token = localStorage.getItem('token');
+            if (!token) return;
+            fetch('/xxapi/userinfo', {
+              headers: { token: token, indiatoken: token }
+            }).then(r => r.json()).then(res => {
+              if (res && res.code === 0 && res.data) {
+                sessionStorage.setItem('cache_userinfo_fast', JSON.stringify(res));
+                const appEl = document.getElementById('app');
+                if (appEl && appEl.__vue__ && appEl.__vue__.$store) {
+                  appEl.__vue__.$store.commit('set_userinfo', res.data);
+                }
+              }
+            }).catch(() => {});
+          } catch(e) {}
+        }
+
+        // Trigger balance sync on user interactions and tab visibility
+        window.addEventListener('visibilitychange', () => {
+          if (!document.hidden) triggerFastBalanceSync();
+        });
+        window.addEventListener('focus', triggerFastBalanceSync);
+        window.addEventListener('hashchange', triggerFastBalanceSync);
+        setInterval(triggerFastBalanceSync, 3000);
+
         // Intercept fetch API responses
         const origFetch = window.fetch;
         if (origFetch) {
           window.fetch = async function(...args) {
+            let reqUrl = '';
+            try {
+              if (typeof args[0] === 'string') reqUrl = args[0];
+              else if (args[0] instanceof URL) reqUrl = args[0].href;
+              else if (args[0] && args[0].url) reqUrl = args[0].url;
+            } catch(e) {}
+
+            const lowerUrl = reqUrl.toLowerCase();
+
+            // Instant Team Page opening: Stale-While-Revalidate
+            if (lowerUrl.includes('/xxapi/teaminfo') || lowerUrl.includes('/xxapi/teaminfothree')) {
+              const cacheKey = lowerUrl.includes('/xxapi/teaminfo') ? 'cache_teaminfo' : 'cache_teaminfothree';
+              const inMemory = fastTeamCache.get(cacheKey) || sessionStorage.getItem(cacheKey);
+
+              // Background refresh
+              const backgroundPromise = origFetch.apply(this, args).then(async (netRes) => {
+                try {
+                  const clone = netRes.clone();
+                  const text = await clone.text();
+                  const sanitized = sanitizeText(text);
+                  fastTeamCache.set(cacheKey, sanitized);
+                  sessionStorage.setItem(cacheKey, sanitized);
+                } catch(e) {}
+                return netRes;
+              }).catch(() => null);
+
+              // If cached, return immediately for 0ms Team page opening!
+              if (inMemory) {
+                return new Response(inMemory, {
+                  status: 200,
+                  statusText: 'OK',
+                  headers: { 'Content-Type': 'application/json' }
+                });
+              }
+
+              // Otherwise await network and cache
+              const realRes = await backgroundPromise;
+              if (realRes) {
+                try {
+                  const clone = realRes.clone();
+                  const text = await clone.text();
+                  const sanitized = sanitizeText(text);
+                  return new Response(sanitized, {
+                    status: realRes.status,
+                    statusText: realRes.statusText,
+                    headers: realRes.headers
+                  });
+                } catch(e) {}
+                return realRes;
+              }
+            }
+
             const res = await origFetch.apply(this, args);
             try {
               const clone = res.clone();
               const text = await clone.text();
-              if (brandRegex.test(text)) {
-                const newText = text.replace(brandRegex, "Monexo Pay");
-                return new Response(newText, {
+              const sanitized = sanitizeText(text);
+              if (sanitized !== text) {
+                return new Response(sanitized, {
                   status: res.status,
                   statusText: res.statusText,
                   headers: res.headers
@@ -253,11 +378,11 @@
           XMLHttpRequest.prototype.send = function(...args) {
             this.addEventListener('readystatechange', function() {
               if (this.readyState === 4 && this.responseText) {
-                if (brandRegex.test(this.responseText)) {
+                const sanitized = sanitizeText(this.responseText);
+                if (sanitized !== this.responseText) {
                   try {
-                    const newText = this.responseText.replace(brandRegex, "Monexo Pay");
-                    Object.defineProperty(this, 'responseText', { value: newText, writable: true });
-                    Object.defineProperty(this, 'response', { value: newText, writable: true });
+                    Object.defineProperty(this, 'responseText', { value: sanitized, writable: true });
+                    Object.defineProperty(this, 'response', { value: sanitized, writable: true });
                   } catch(e) {}
                 }
               }

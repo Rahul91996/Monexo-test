@@ -399,6 +399,8 @@ var transactionSchema = new import_mongoose.default.Schema({
 });
 userSchema.index({ token: 1 });
 userSchema.index({ "sessions.token": 1 });
+userSchema.index({ invitercode: 1 });
+userSchema.index({ parentUser: 1 });
 transactionSchema.index({ userId: 1 });
 transactionSchema.index({ sellerId: 1 });
 transactionSchema.index({ buyerUserId: 1 });
@@ -408,6 +410,9 @@ transactionSchema.index({ buyerPhone: 1 });
 transactionSchema.index({ payer_status: 1 });
 transactionSchema.index({ type: 1 });
 transactionSchema.index({ ctime: -1 });
+transactionSchema.index({ rptNo: 1 });
+transactionSchema.index({ phone: 1, ctime: -1 });
+transactionSchema.index({ phone: 1, payer_status: 1, ctime: -1 });
 var notificationSchema = new import_mongoose.default.Schema({
   userId: { type: import_mongoose.default.Schema.Types.Mixed, required: true, index: true },
   phone: { type: String, index: true },
@@ -731,7 +736,7 @@ function getStartAndEndSecFromDateStr(dateStr) {
   const startSec = Math.floor(utcStartOfDay.getTime() / 1e3);
   return { startSec, endSec: startSec + 86399 };
 }
-async function calculateUserDailyData(user, startSec, endSec) {
+async function calculateUserDailyData(user, startSec, endSec, preloadedMembers) {
   if (!user) {
     return {
       times: 0,
@@ -760,8 +765,9 @@ async function calculateUserDailyData(user, startSec, endSec) {
     isAdminAddition: { $ne: true },
     isUsdt: { $ne: true },
     rptNo: { $not: /^(ADM|TXN_ADM|NWB|INV|USDT|MANUAL)/i },
-    reason_for_rejection: { $not: /Admin|Manual|Adjustment|Add|Subtract|Bonus|Reward|Newbie|Invite/i }
-  }).lean();
+    reason_for_rejection: { $not: /Admin|Manual|Adjustment|Add|Subtract|Bonus|Reward|Newbie|Invite/i },
+    ctime: { $gte: startSec - 60, $lte: endSec + 60 }
+  }).lean().select("amount reward ctime payer_status type isAdminAddition isUsdt rptNo payee_bank_account sellerId sellerPhone ct_account paymentNodeId ctType utr");
   let times = 0;
   let recharge = 0;
   let reward = 0;
@@ -803,7 +809,7 @@ async function calculateUserDailyData(user, startSec, endSec) {
     payer_status: 3,
     type: "sell",
     ctime: { $gte: startSec, $lte: endSec }
-  });
+  }).lean().select("amount");
   const sellTimes = sellTxs.length;
   let performance = 0;
   for (const stx of sellTxs) {
@@ -813,15 +819,39 @@ async function calculateUserDailyData(user, startSec, endSec) {
   let dividend = 0;
   const inviteCode = user.ownInviteCode || user.referralCode || "";
   const userProviderId = user.providerId || "";
-  const level1Members = await User.find({
-    $or: [
-      { invitercode: inviteCode },
-      { parentUser: inviteCode },
-      ...userProviderId ? [{ invitercode: userProviderId }, { parentUser: userProviderId }] : []
-    ]
-  });
-  const level1Phones = level1Members.map((m) => m.phone).filter(Boolean);
-  const level1Codes = level1Members.flatMap((m) => [m.ownInviteCode, m.referralCode, m.providerId, m._id ? m._id.toString() : ""].filter(Boolean));
+  let level1Members = preloadedMembers?.level1Members;
+  let level2Members = preloadedMembers?.level2Members;
+  let level3Members = preloadedMembers?.level3Members;
+  if (!level1Members) {
+    level1Members = await User.find({
+      $or: [
+        { invitercode: inviteCode },
+        { parentUser: inviteCode },
+        ...userProviderId ? [{ invitercode: userProviderId }, { parentUser: userProviderId }] : []
+      ]
+    }).lean().select("phone ownInviteCode referralCode providerId _id");
+  }
+  const level1Phones = (level1Members || []).map((m) => m.phone).filter(Boolean);
+  const level1Codes = (level1Members || []).flatMap((m) => [m.ownInviteCode, m.referralCode, m.providerId, m._id ? m._id.toString() : ""].filter(Boolean));
+  if (!level2Members && level1Codes.length > 0) {
+    level2Members = await User.find({
+      $or: [
+        { invitercode: { $in: level1Codes } },
+        { parentUser: { $in: level1Codes } }
+      ]
+    }).lean().select("phone ownInviteCode referralCode providerId _id");
+  }
+  const level2Phones = (level2Members || []).map((m) => m.phone).filter(Boolean);
+  const level2Codes = (level2Members || []).flatMap((m) => [m.ownInviteCode, m.referralCode, m.providerId, m._id ? m._id.toString() : ""].filter(Boolean));
+  if (!level3Members && level2Codes.length > 0) {
+    level3Members = await User.find({
+      $or: [
+        { invitercode: { $in: level2Codes } },
+        { parentUser: { $in: level2Codes } }
+      ]
+    }).lean().select("phone ownInviteCode referralCode providerId _id");
+  }
+  const level3Phones = (level3Members || []).map((m) => m.phone).filter(Boolean);
   const validDownlineBuyFilter = {
     payer_status: 3,
     type: { $in: ["buy", "recharge", "buyitoken", "BUY", "Buy"] },
@@ -831,50 +861,25 @@ async function calculateUserDailyData(user, startSec, endSec) {
     reason_for_rejection: { $not: /Admin|Manual|Adjustment|Add|Subtract|Bonus|Reward|Newbie|Invite/i },
     ctime: { $gte: startSec, $lte: endSec }
   };
-  if (level1Phones.length > 0) {
-    const l1BuyTxs = await Transaction.find({
-      phone: { $in: level1Phones },
+  const allDownlinePhones = [...level1Phones, ...level2Phones, ...level3Phones];
+  if (allDownlinePhones.length > 0) {
+    const downlineTxs = await Transaction.find({
+      phone: { $in: allDownlinePhones },
       ...validDownlineBuyFilter
-    });
-    const l1Sum = l1BuyTxs.reduce((sum, t) => sum + (t.amount || 0), 0);
-    dividend += l1Sum * 3e-3;
-  }
-  let level2Members = [];
-  if (level1Codes.length > 0) {
-    level2Members = await User.find({
-      $or: [
-        { invitercode: { $in: level1Codes } },
-        { parentUser: { $in: level1Codes } }
-      ]
-    });
-  }
-  const level2Phones = level2Members.map((m) => m.phone).filter(Boolean);
-  const level2Codes = level2Members.flatMap((m) => [m.ownInviteCode, m.referralCode, m.providerId, m._id ? m._id.toString() : ""].filter(Boolean));
-  if (level2Phones.length > 0) {
-    const l2BuyTxs = await Transaction.find({
-      phone: { $in: level2Phones },
-      ...validDownlineBuyFilter
-    });
-    const l2Sum = l2BuyTxs.reduce((sum, t) => sum + (t.amount || 0), 0);
-    dividend += l2Sum * 2e-3;
-  }
-  let level3Members = [];
-  if (level2Codes.length > 0) {
-    level3Members = await User.find({
-      $or: [
-        { invitercode: { $in: level2Codes } },
-        { parentUser: { $in: level2Codes } }
-      ]
-    });
-  }
-  const level3Phones = level3Members.map((m) => m.phone).filter(Boolean);
-  if (level3Phones.length > 0) {
-    const l3BuyTxs = await Transaction.find({
-      phone: { $in: level3Phones },
-      ...validDownlineBuyFilter
-    });
-    const l3Sum = l3BuyTxs.reduce((sum, t) => sum + (t.amount || 0), 0);
-    dividend += l3Sum * 1e-3;
+    }).lean().select("phone amount");
+    const l1Set = new Set(level1Phones);
+    const l2Set = new Set(level2Phones);
+    const l3Set = new Set(level3Phones);
+    for (const dTx of downlineTxs) {
+      const amt = Number(dTx.amount) || 0;
+      if (l1Set.has(dTx.phone)) {
+        dividend += amt * 3e-3;
+      } else if (l2Set.has(dTx.phone)) {
+        dividend += amt * 2e-3;
+      } else if (l3Set.has(dTx.phone)) {
+        dividend += amt * 1e-3;
+      }
+    }
   }
   dividend = Math.round(dividend * 100) / 100;
   let bonus = 0;
@@ -1488,6 +1493,19 @@ function getApproxLocation(ip) {
   return cities[index];
 }
 var userTokenCache = /* @__PURE__ */ new Map();
+var teamInfoMemoryCache = /* @__PURE__ */ new Map();
+var teamInfoThreeCache = /* @__PURE__ */ new Map();
+function invalidateUserCache(phoneOrId) {
+  if (!phoneOrId) return;
+  const target = String(phoneOrId).trim();
+  for (const [t, entry] of userTokenCache.entries()) {
+    if (entry?.user?.phone === target || entry?.user?.mobileNo === target || entry?.user?._id?.toString() === target || entry?.user?.providerId === target) {
+      userTokenCache.delete(t);
+    }
+  }
+  teamInfoMemoryCache.delete(target);
+  teamInfoThreeCache.delete(target);
+}
 async function getUserByToken(req) {
   let token = req.headers["indiatoken"] || req.headers["token"] || req.headers["INDIATOKEN"] || req.query?.token || req.query?.indiatoken;
   if (!token) return null;
@@ -1503,7 +1521,7 @@ async function getUserByToken(req) {
     return null;
   }
   const cached = userTokenCache.get(token);
-  if (cached && Date.now() - cached.cachedAt < 3e4) {
+  if (cached && Date.now() - cached.cachedAt < 3e3) {
     return cached.user;
   }
   if (token === "token-7870873927" || token.includes("token-7870873927") || token.includes("7870873927")) {
@@ -1938,6 +1956,8 @@ async function ensureBuyerBalanceCredited(tx, fallbackUser) {
     });
     console.log(`[INSTANT WALLET CREDIT +4% x1] Buyer ${updatedBuyer.phone} credited +\u20B9${amount} + \u20B9${reward4Pct} (4% reward). Total: \u20B9${totalCredit}. New Balance: \u20B9${updatedBuyer.balance}`);
     buyerActiveOrderMap.clear();
+    invalidateUserCache(updatedBuyer.phone);
+    invalidateUserCache(updatedBuyer._id);
     if (claimedTx && claimedTx.rptNo) {
       await PaymentNode.updateOne(
         { claimedRptNo: claimedTx.rptNo },
@@ -2918,7 +2938,18 @@ app.get(["/xxapi/userinfo", "/userinfo"], async (req, res) => {
     const availableIToken = Math.max(0, currentTotalBalance - frozenItoken);
     const myInviteCode = freshUser.ownInviteCode || freshUser.referralCode || "";
     const userPhone = freshUser.phone || freshUser.mobileNo || freshUser.username || "";
-    const todayDailyData = await calculateUserDailyData(freshUser, getISTTodayStartSec(), getISTTodayStartSec() + 86399);
+    let todayProfitVal = Number(freshUser.todayProfit || 0);
+    if (!todayProfitVal) {
+      try {
+        const todayTxs = await Transaction.find({
+          $or: [{ phone: userPhone }, { userId: freshUser._id }],
+          payer_status: 3,
+          ctime: { $gte: getISTTodayStartSec() }
+        }).lean().select("reward amount type").limit(30);
+        todayProfitVal = todayTxs.reduce((sum, t) => sum + (Number(t.reward) || (t.type === "reward" ? Number(t.amount) : 0)), 0);
+      } catch (e) {
+      }
+    }
     let globalConfig = null;
     try {
       globalConfig = await SiteConfig.findOne({ key: "global" });
@@ -2950,7 +2981,7 @@ app.get(["/xxapi/userinfo", "/userinfo"], async (req, res) => {
         kycStatus: freshUser.kycStatus ?? 0,
         realName: freshUser.realName || freshUser.fullName || "",
         parentUser: freshUser.parentUser || "",
-        todayProfit: todayDailyData.totalProfit,
+        todayProfit: todayProfitVal,
         sysOpenPay: 1,
         trc20Address: freshUser.trc20Address || defaultTrc20Addr,
         net: freshUser.net || "",
@@ -8807,6 +8838,11 @@ app.get("/xxapi/teaminfo", async (req, res) => {
   if (!user) {
     return res.json({ code: 403, msg: "Unauthorized" });
   }
+  const cacheKey = String(user._id || user.phone);
+  const cached = teamInfoMemoryCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < 1e4) {
+    return res.json(cached.data);
+  }
   let needsSave = false;
   if (!user.providerId) {
     user.providerId = await getUniqueProviderId();
@@ -8831,7 +8867,7 @@ app.get("/xxapi/teaminfo", async (req, res) => {
       { invitercode: user.providerId },
       { parentUser: user.providerId }
     ]
-  });
+  }).lean().select("phone ownInviteCode referralCode providerId _id recharge");
   const level1Count = directMembers.length;
   const level1Codes = directMembers.flatMap((m) => [m.ownInviteCode, m.referralCode, m.providerId, m._id ? m._id.toString() : ""].filter(Boolean));
   let level2Members = [];
@@ -8841,7 +8877,7 @@ app.get("/xxapi/teaminfo", async (req, res) => {
         { invitercode: { $in: level1Codes } },
         { parentUser: { $in: level1Codes } }
       ]
-    });
+    }).lean().select("phone ownInviteCode referralCode providerId _id recharge");
   }
   const level2Count = level2Members.length;
   const level2Codes = level2Members.flatMap((m) => [m.ownInviteCode, m.referralCode, m.providerId, m._id ? m._id.toString() : ""].filter(Boolean));
@@ -8852,7 +8888,7 @@ app.get("/xxapi/teaminfo", async (req, res) => {
         { invitercode: { $in: level2Codes } },
         { parentUser: { $in: level2Codes } }
       ]
-    });
+    }).lean().select("phone ownInviteCode referralCode providerId _id recharge");
   }
   const level3Count = level3Members.length;
   const totalTeamCount = level1Count + level2Count + level3Count;
@@ -8860,12 +8896,19 @@ app.get("/xxapi/teaminfo", async (req, res) => {
   const todayEndSec = todayStartSec + 86399;
   const yesterdayStartSec = getISTYesterdayStartSec();
   const yesterdayEndSec = getISTYesterdayEndSec();
-  const todayDailyData = await calculateUserDailyData(user, todayStartSec, todayEndSec);
-  const yesterdayDailyData = await calculateUserDailyData(user, yesterdayStartSec, yesterdayEndSec);
+  const preloaded = {
+    level1Members: directMembers,
+    level2Members,
+    level3Members
+  };
+  const [todayDailyData, yesterdayDailyData] = await Promise.all([
+    calculateUserDailyData(user, todayStartSec, todayEndSec, preloaded),
+    calculateUserDailyData(user, yesterdayStartSec, yesterdayEndSec, preloaded)
+  ]);
   const totalCommission = Number(user.commission || 0);
   const totalRecharge = directMembers.reduce((sum, m) => sum + (m.recharge || 0), 0);
   const rsUrl = req.protocol + "://" + req.get("host") + "/#/rs/";
-  return res.json({
+  const resultData = {
     code: 0,
     msg: "success",
     data: {
@@ -8880,14 +8923,12 @@ app.get("/xxapi/teaminfo", async (req, res) => {
       today: {
         recharge: todayDailyData.recharge,
         dividend: todayDailyData.dividend,
-        // Strictly team commission L1+L2+L3
         reward: todayDailyData.reward,
         bonus: todayDailyData.bonus
       },
       yesterday: {
         recharge: yesterdayDailyData.recharge,
         dividend: yesterdayDailyData.dividend,
-        // Strictly team commission L1+L2+L3
         reward: yesterdayDailyData.reward,
         bonus: yesterdayDailyData.bonus
       },
@@ -8912,11 +8953,18 @@ app.get("/xxapi/teaminfo", async (req, res) => {
       newbieDayStep: 1,
       notShowInvite: false
     }
-  });
+  };
+  teamInfoMemoryCache.set(cacheKey, { data: resultData, timestamp: Date.now() });
+  return res.json(resultData);
 });
 app.get("/xxapi/teaminfothree/:param", async (req, res) => {
   const user = await getUserByToken(req);
   if (!user) return res.json({ code: 403, msg: "Unauthorized" });
+  const cacheKey = String(user._id || user.phone);
+  const cached = teamInfoThreeCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < 1e4) {
+    return res.json(cached.data);
+  }
   const inviteCode = user.ownInviteCode || user.referralCode || "";
   const userProviderId = user.providerId || "";
   const level1Members = await User.find({
@@ -8925,19 +8973,9 @@ app.get("/xxapi/teaminfothree/:param", async (req, res) => {
       { parentUser: inviteCode },
       ...userProviderId ? [{ invitercode: userProviderId }, { parentUser: userProviderId }] : []
     ]
-  });
+  }).lean().select("phone ownInviteCode referralCode providerId _id");
   const level1Phones = level1Members.map((m) => m.phone).filter(Boolean);
   const level1Codes = level1Members.flatMap((m) => [m.ownInviteCode, m.referralCode, m.providerId, m._id ? m._id.toString() : ""].filter(Boolean));
-  let level1Recharge = 0;
-  if (level1Phones.length > 0) {
-    const l1Txs = await Transaction.find({
-      phone: { $in: level1Phones },
-      payer_status: 3,
-      type: { $ne: "sell" }
-    });
-    level1Recharge = l1Txs.reduce((sum, t) => sum + (t.amount || 0), 0);
-  }
-  const level1Comm = (level1Recharge * 3e-3).toFixed(2);
   let level2Members = [];
   if (level1Codes.length > 0) {
     level2Members = await User.find({
@@ -8945,43 +8983,40 @@ app.get("/xxapi/teaminfothree/:param", async (req, res) => {
         { invitercode: { $in: level1Codes } },
         { parentUser: { $in: level1Codes } }
       ]
-    });
+    }).lean().select("phone ownInviteCode referralCode providerId _id");
   }
   const level2Phones = level2Members.map((m) => m.phone).filter(Boolean);
+  const todayStartSec = Math.floor((/* @__PURE__ */ new Date()).setHours(0, 0, 0, 0) / 1e3);
+  const allPhones = [...level1Phones, ...level2Phones];
+  let level1Recharge = 0;
   let level2Recharge = 0;
-  if (level2Phones.length > 0) {
-    const l2Txs = await Transaction.find({
-      phone: { $in: level2Phones },
+  let todayL1Recharge = 0;
+  let todayL2Recharge = 0;
+  if (allPhones.length > 0) {
+    const allTxs = await Transaction.find({
+      phone: { $in: allPhones },
       payer_status: 3,
       type: { $ne: "sell" }
-    });
-    level2Recharge = l2Txs.reduce((sum, t) => sum + (t.amount || 0), 0);
+    }).lean().select("phone amount ctime");
+    const l1PhoneSet = new Set(level1Phones);
+    const l2PhoneSet = new Set(level2Phones);
+    for (const tx of allTxs) {
+      const amt = Number(tx.amount) || 0;
+      const isToday = (tx.ctime || 0) >= todayStartSec;
+      if (l1PhoneSet.has(tx.phone)) {
+        level1Recharge += amt;
+        if (isToday) todayL1Recharge += amt;
+      } else if (l2PhoneSet.has(tx.phone)) {
+        level2Recharge += amt;
+        if (isToday) todayL2Recharge += amt;
+      }
+    }
   }
+  const level1Comm = (level1Recharge * 3e-3).toFixed(2);
   const level2Comm = (level2Recharge * 2e-3).toFixed(2);
-  const todayStartSec = Math.floor((/* @__PURE__ */ new Date()).setHours(0, 0, 0, 0) / 1e3);
-  let todayL1Recharge = 0;
-  if (level1Phones.length > 0) {
-    const todayL1Txs = await Transaction.find({
-      phone: { $in: level1Phones },
-      payer_status: 3,
-      type: { $ne: "sell" },
-      ctime: { $gte: todayStartSec }
-    });
-    todayL1Recharge = todayL1Txs.reduce((sum, t) => sum + (t.amount || 0), 0);
-  }
   const todayL1Comm = (todayL1Recharge * 3e-3).toFixed(2);
-  let todayL2Recharge = 0;
-  if (level2Phones.length > 0) {
-    const todayL2Txs = await Transaction.find({
-      phone: { $in: level2Phones },
-      payer_status: 3,
-      type: { $ne: "sell" },
-      ctime: { $gte: todayStartSec }
-    });
-    todayL2Recharge = todayL2Txs.reduce((sum, t) => sum + (t.amount || 0), 0);
-  }
   const todayL2Comm = (todayL2Recharge * 2e-3).toFixed(2);
-  return res.json({
+  const result = {
     code: 0,
     msg: "success",
     data: {
@@ -8998,7 +9033,9 @@ app.get("/xxapi/teaminfothree/:param", async (req, res) => {
       today_two_totalrecharge: todayL2Recharge,
       today_two_commission: todayL2Comm
     }
-  });
+  };
+  teamInfoThreeCache.set(cacheKey, { data: result, timestamp: Date.now() });
+  return res.json(result);
 });
 app.get("/xxapi/myTeam", async (req, res) => {
   try {
@@ -9527,6 +9564,9 @@ app.post("/xxapi/admin/updateBalance", requireAdmin, async (req, res) => {
       });
       await newTx.save();
     }
+    invalidateUserCache(user.phone);
+    invalidateUserCache(user.mobileNo);
+    invalidateUserCache(user._id);
     return res.json({ code: 0, msg: "Balance updated successfully", balance: user.balance });
   } catch (err) {
     console.error("Update balance error:", err);
