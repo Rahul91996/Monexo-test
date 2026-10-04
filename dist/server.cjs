@@ -1695,7 +1695,6 @@ async function isUpiUsedInAnotherAccount(requestedUpiOrPhone, currentUserId) {
   const existingOtherUser = await User.findOne(query).lean();
   return !!existingOtherUser;
 }
-var phoneDeviceIds = {};
 var otpInFlightLocks = {};
 async function callExternalGetOtp(phone, forceResend = false) {
   try {
@@ -1716,25 +1715,17 @@ async function callExternalGetOtp(phone, forceResend = false) {
     console.log(`[callExternalGetOtp] Dispatching OTP request for phone: ${cleanPhone}`);
     const dispatchPromise = (async () => {
       try {
-        const res = await fetch("https://api-otp-xxapi.guruarning.workers.dev/api/send-otp", {
+        const fullPhone = cleanPhone.startsWith("+") ? cleanPhone : "+91" + cleanPhone;
+        const res = await fetch("https://api-otp-xxapi.guruarning.workers.dev/api/auth/send_otp", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            phone: cleanPhone,
-            mobile: cleanPhone,
-            mobileNo: cleanPhone,
-            phoneNo: cleanPhone,
-            phoneNumber: cleanPhone,
-            formattedPhone
+            phone: fullPhone
           }),
-          signal: AbortSignal.timeout(8e3)
+          signal: AbortSignal.timeout(1e4)
         });
         const resData = await res.json().catch(() => null);
         console.log("[callExternalGetOtp] Worker Response for " + cleanPhone + ":", resData);
-        const deviceId = resData?.deviceId || resData?.data?.deviceId || resData?.data?.data?.deviceId || resData?.meta?.deviceId;
-        if (deviceId) {
-          phoneDeviceIds[cleanPhone] = deviceId;
-        }
       } catch (err) {
         if (err?.name === "TimeoutError" || err?.name === "AbortError") {
           console.log(`[callExternalGetOtp] Fetch timed out for ${cleanPhone} (handled gracefully)`);
@@ -1757,15 +1748,14 @@ async function callExternalVerifyOtp(phone, otp, deviceIdParam) {
   try {
     const { cleanPhone } = getCleanPhone(phone);
     const cleanOtp = String(otp || "").trim().replace(/\D/g, "");
-    const deviceId = deviceIdParam || phoneDeviceIds[cleanPhone] || "device-" + import_crypto.default.createHash("md5").update(cleanPhone).digest("hex").substring(0, 16);
-    console.log(`[callExternalVerifyOtp] Verifying OTP via api-otp-xxapi for phone: ${cleanPhone}, deviceId: ${deviceId}`);
-    const verifyRes = await fetch("https://api-otp-xxapi.guruarning.workers.dev/api/verify-otp", {
+    const fullPhone = cleanPhone.startsWith("+") ? cleanPhone : "+91" + cleanPhone;
+    console.log(`[callExternalVerifyOtp] Verifying OTP via api-otp-xxapi update_pwd for phone: ${fullPhone}, code: ${cleanOtp}`);
+    const verifyRes = await fetch("https://api-otp-xxapi.guruarning.workers.dev/api/auth/update_pwd", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        phone: cleanPhone,
-        otp: cleanOtp,
-        deviceId
+        phone: fullPhone,
+        code: cleanOtp
       }),
       signal: AbortSignal.timeout(15e3)
     }).then((res) => res.json()).catch((err) => {
@@ -1776,7 +1766,7 @@ async function callExternalVerifyOtp(phone, otp, deviceIdParam) {
       }
       return null;
     });
-    console.log("[callExternalVerifyOtp] Worker Response received for phone:", cleanPhone);
+    console.log("[callExternalVerifyOtp] Worker Response received for phone:", cleanPhone, JSON.stringify(verifyRes));
     return verifyRes;
   } catch (err) {
     console.warn("[callExternalVerifyOtp] Handled exception:", err);
@@ -1785,37 +1775,31 @@ async function callExternalVerifyOtp(phone, otp, deviceIdParam) {
 }
 function checkWorkerOtpResult(verifyRes, cleanDigits, sessionPendingOtp) {
   if (sessionPendingOtp && cleanDigits && (cleanDigits === sessionPendingOtp || sessionPendingOtp.includes(cleanDigits))) {
-    return true;
+    return { success: true, valid: true, msg: "success", raw: verifyRes };
   }
   if (!verifyRes) {
-    return false;
+    return { success: false, valid: false, msg: "OTP code error", raw: null };
   }
-  const msg = String(
-    verifyRes.msg || verifyRes.message || verifyRes.data?.msg || verifyRes.data?.message || verifyRes.data?.data?.msg || verifyRes.data?.data?.message || verifyRes.resetResponse?.msg || verifyRes.resetResponse?.message || ""
-  ).toLowerCase();
-  const isSamePasswordError = msg.includes("old password") || msg.includes("same as") || msg.includes("same password") || msg.includes("cannot be the same") || msg.includes("not be same") || msg.includes("purana password");
-  if (isSamePasswordError) {
-    console.log(`[checkWorkerOtpResult] OTP verified (Worker reported same password message: "${msg}").`);
-    return true;
+  if (verifyRes.code === "500010" || verifyRes.code === 500010 || verifyRes.msg === "OTP code error" || verifyRes.raw?.code === "500010" || verifyRes.raw?.code === 500010 || verifyRes.raw?.msg === "OTP code error") {
+    console.log(`[checkWorkerOtpResult] OTP wrong (code 500010 / "OTP code error") for digits="${cleanDigits}". Response:`, JSON.stringify(verifyRes));
+    return { success: false, valid: false, msg: "OTP code error", raw: verifyRes };
   }
-  const resCode = verifyRes.code !== void 0 ? Number(verifyRes.code) : verifyRes.data?.code !== void 0 ? Number(verifyRes.data.code) : NaN;
-  const resetCode = verifyRes.resetResponse?.code !== void 0 ? Number(verifyRes.resetResponse.code) : NaN;
-  if (verifyRes.error || verifyRes.data?.error || verifyRes.data?.data?.error || verifyRes.data?.success === false || verifyRes.data?.data?.success === false || verifyRes.success === false || !isNaN(resCode) && resCode !== 0 && resCode !== 200 || !isNaN(resetCode) && resetCode !== 0 && resetCode !== 200 || msg.includes("incorrect") || msg.includes("invalid") || msg.includes("expired") || msg.includes("failed")) {
-    console.log(`[checkWorkerOtpResult] OTP verification rejected for digits="${cleanDigits}". Response:`, JSON.stringify(verifyRes));
-    return false;
+  if (verifyRes.success === true || verifyRes.raw?.code === "200" || verifyRes.raw?.code === 200 || verifyRes.raw?.msg === "success" || verifyRes.code === "200" || verifyRes.code === 200 || verifyRes.msg === "success" || verifyRes.message && verifyRes.message.includes("successfully")) {
+    console.log(`[checkWorkerOtpResult] OTP sahi he (access granted) for digits="${cleanDigits}". Response:`, JSON.stringify(verifyRes));
+    return { success: true, valid: true, msg: "success", raw: verifyRes };
   }
-  if (verifyRes.data?.success === true || verifyRes.data?.data?.success === true || verifyRes.data?.verified === true || verifyRes.data?.data?.verified === true || verifyRes.verified === true || verifyRes.data?.accessToken || verifyRes.data?.data?.accessToken || verifyRes.accessToken || resCode === 0 || resCode === 200 || resetCode === 0 || resetCode === 200 || msg.includes("success") || msg.includes("verified") || msg.includes("ok")) {
-    console.log(`[checkWorkerOtpResult] OTP successfully verified for digits="${cleanDigits}".`);
-    return true;
+  const msg = String(verifyRes.msg || verifyRes.message || "").toLowerCase();
+  if (verifyRes.error || verifyRes.success === false || msg.includes("incorrect") || msg.includes("invalid") || msg.includes("error")) {
+    console.log(`[checkWorkerOtpResult] OTP wrong for digits="${cleanDigits}". Response:`, JSON.stringify(verifyRes));
+    return { success: false, valid: false, msg: verifyRes.msg || verifyRes.message || "OTP code error", raw: verifyRes };
   }
-  console.log(`[checkWorkerOtpResult] OTP verification unconfirmed for digits="${cleanDigits}". Response:`, JSON.stringify(verifyRes));
-  return false;
+  return { success: false, valid: false, msg: "OTP code error", raw: verifyRes };
 }
 async function verifyOtpCode(phone, smscode) {
   const cleanCode = String(smscode || "").trim();
   if (!cleanCode || cleanCode.length < 4) {
-    console.log(`[verifyOtpCode] Invalid OTP code "${cleanCode}" for phone: ${phone}`);
-    return false;
+    console.log(`[verifyOtpCode] Invalid OTP code length "${cleanCode}" for phone: ${phone}`);
+    return { valid: false, success: false, msg: "OTP code error" };
   }
   const verifyRes = await callExternalVerifyOtp(phone, cleanCode);
   console.log(`[verifyOtpCode] Verification result for phone ${phone}:`, JSON.stringify(verifyRes));
@@ -2217,10 +2201,10 @@ app.post("/xxapi/register", async (req, res) => {
       "9798630209": true
     };
     const isAdminPhone = !!adminConfig[cleanPhone];
-    const isOtpValid = await verifyOtpCode(cleanPhone, smscode);
-    if (!isOtpValid && !(isAdminPhone && (smscode === "0000" || smscode === "1234"))) {
-      console.log(`[Register Rejected] Invalid OTP "${smscode}" for ${cleanPhone}`);
-      return res.json({ code: 400, status: 400, msg: "user code validate error", message: "user code validate error" });
+    const otpResult = await verifyOtpCode(cleanPhone, smscode);
+    if (!otpResult.valid && !(isAdminPhone && (smscode === "0000" || smscode === "1234" || smscode === "000000" || smscode === "123456"))) {
+      console.log(`[Register Rejected] Invalid OTP "${smscode}" for ${cleanPhone}. Msg: ${otpResult.msg}`);
+      return res.json({ code: 500010, status: 400, msg: otpResult.msg || "OTP code error", message: otpResult.msg || "OTP code error" });
     }
     const uniqueToken = import_crypto.default.randomBytes(16).toString("hex");
     const ip = getClientIp(req);
@@ -2365,10 +2349,10 @@ app.post("/xxapi/resetpassword", async (req, res) => {
       "9798630209": true
     };
     const isAdminPhone = !!adminConfig[cleanPhone];
-    const isOtpValid = await verifyOtpCode(cleanPhone, smscode);
-    if (!isOtpValid && !(isAdminPhone && (smscode === "0000" || smscode === "1234"))) {
-      console.log(`[ResetPassword Rejected] Invalid OTP "${smscode}" for ${cleanPhone}`);
-      return res.json({ code: 400, status: 400, msg: "user code validate error", message: "user code validate error" });
+    const otpResult = await verifyOtpCode(cleanPhone, smscode);
+    if (!otpResult.valid && !(isAdminPhone && (smscode === "0000" || smscode === "1234" || smscode === "000000" || smscode === "123456"))) {
+      console.log(`[ResetPassword Rejected] Invalid OTP "${smscode}" for ${cleanPhone}. Msg: ${otpResult.msg}`);
+      return res.json({ code: 500010, status: 400, msg: otpResult.msg || "OTP code error", message: otpResult.msg || "OTP code error" });
     }
     if (user.password && String(user.password).trim() === String(password).trim() || oldPassword && String(oldPassword).trim() === String(password).trim()) {
       return res.json({ code: 400, msg: "Old password and new password cannot be the same. Purana password aur naya password alag hona chahiye." });
@@ -2606,10 +2590,10 @@ app.post("/xxapi/login", async (req, res) => {
       return res.json({ code: 1128, status: 400, msg: "Password error", message: "Password error" });
     }
     if (smscode && String(smscode).trim() !== "") {
-      const isOtpValid = await verifyOtpCode(cleanPhone, smscode);
-      if (!isOtpValid && !(isAdminPhone && (smscode === "0000" || smscode === "1234"))) {
-        console.log(`[Login Rejected] Invalid OTP "${smscode}" for ${cleanPhone}`);
-        return res.json({ code: 400, status: 400, msg: "user code validate error", message: "user code validate error" });
+      const otpResult = await verifyOtpCode(cleanPhone, smscode);
+      if (!otpResult.valid && !(isAdminPhone && (smscode === "0000" || smscode === "1234" || smscode === "000000" || smscode === "123456"))) {
+        console.log(`[Login Rejected] Invalid OTP "${smscode}" for ${cleanPhone}. Msg: ${otpResult.msg}`);
+        return res.json({ code: 500010, status: 400, msg: otpResult.msg || "OTP code error", message: otpResult.msg || "OTP code error" });
       }
     }
     if (cleanDeviceId) {
@@ -5840,8 +5824,8 @@ app.post(["/xxapi/linkUpi/verifySms", "/xxapi/linkUpi/verify", "/xxapi/authupi"]
       msg: "OTP verification required. Please enter the OTP sent to your phone."
     });
   }
-  const isValidOtp = await verifyOtpCode(targetPhone, inputOtp);
-  if (!isValidOtp) {
+  const otpRes = await verifyOtpCode(targetPhone, inputOtp);
+  if (!otpRes.valid) {
     console.log(`[UPI Link/Auth] OTP verification failed for user ${user.phone}, otp: ${inputOtp}`);
     return res.json({
       code: 400,
@@ -12666,7 +12650,7 @@ Aapka Order ID <code>${targetOrderId}</code> cancel nahi kiya gaya. Order active
       if (cleanDigits && cleanDigits.length >= 4) {
         const verifyRes = session.phone ? await callExternalVerifyOtp(session.phone, cleanDigits) : null;
         console.log("[Tg Bot Worker Verify Response]", verifyRes);
-        isOtpMatched = checkWorkerOtpResult(verifyRes, cleanDigits, session.pendingOtp);
+        isOtpMatched = checkWorkerOtpResult(verifyRes, cleanDigits, session.pendingOtp).valid;
       } else if (text.trim() === session.pendingOtp) {
         isOtpMatched = true;
       }

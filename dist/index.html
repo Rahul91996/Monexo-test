@@ -567,42 +567,72 @@
       }
     </script>
     <script>
-      // Global OTP Input Observer (SuperMoney 6-Digit OTP Support)
+      // Global 6-Digit OTP Support on Login, Register, and Forgot Password Pages
       (function() {
-        function fixOtpInputs() {
-          const inputs = document.querySelectorAll('input, md-input-item');
-          inputs.forEach(input => {
-            const ph = (input.getAttribute('placeholder') || '').toLowerCase();
-            const nm = (input.getAttribute('name') || '').toLowerCase();
-            const tp = (input.getAttribute('type') || '').toLowerCase();
-            const isOtp = ph.includes('otp') || nm.includes('otp') || ph.includes('code') || ph.includes('verification') || ph.includes('digit') || tp === 'tel' || tp === 'number';
+        function enforceSixDigitOtp() {
+          try {
+            const hash = (window.location.hash || '').toLowerCase();
+            const isAuthPage = hash.includes('login') || hash.includes('/rs') || hash.includes('register') || hash.includes('editpassword') || hash.includes('resetpassword') || hash.includes('forgot');
             
-            if (isOtp || input.classList.contains('otp-input') || input.closest('.md-dialog') || input.closest('.dialog-content')) {
-              const pageText = (document.body.innerText || '').toLowerCase();
-              if (pageText.includes('phonepe')) {
-                const currentMax = input.getAttribute('maxlength');
-                if (currentMax === '6') {
-                  input.setAttribute('maxlength', '5');
+            // Walk Vue component tree to enforce maxlength 6 on Login, Register, registercf, and editpassword
+            const appEl = document.getElementById('app');
+            if (appEl && appEl.__vue__) {
+              function walkComponents(vm) {
+                if (!vm) return;
+                const name = (vm.$options && vm.$options.name) || '';
+                if (name === 'Login' || name === 'Register' || name === 'registercf' || name === 'register' || name === 'editpassword') {
+                  if (vm.maxlength === '4' || vm.maxlength === 4) {
+                    vm.maxlength = '6';
+                  }
+                  if (vm.$refs && vm.$refs.captcha) {
+                    if (vm.$refs.captcha.maxlength === 4 || vm.$refs.captcha.maxlength === '4') {
+                      vm.$refs.captcha.maxlength = 6;
+                    }
+                  }
                 }
-              } else {
-                const currentMax = input.getAttribute('maxlength');
-                if (currentMax === '4' || currentMax === '5') {
-                  input.setAttribute('maxlength', '6');
+                if (vm.$children && Array.isArray(vm.$children)) {
+                  vm.$children.forEach(walkComponents);
                 }
               }
+              walkComponents(appEl.__vue__);
             }
-          });
+
+            const inputs = document.querySelectorAll('input, md-input-item');
+            inputs.forEach(input => {
+              const ph = (input.getAttribute('placeholder') || '').toLowerCase();
+              const nm = (input.getAttribute('name') || '').toLowerCase();
+              const tp = (input.getAttribute('type') || '').toLowerCase();
+              const isOtp = ph.includes('otp') || nm.includes('otp') || ph.includes('code') || ph.includes('verification') || ph.includes('digit') || tp === 'tel' || tp === 'number';
+              
+              if (isOtp || input.classList.contains('otp-input') || input.closest('.md-dialog') || input.closest('.dialog-content') || input.closest('.md-captcha')) {
+                const currentMax = input.getAttribute('maxlength');
+                if (isAuthPage) {
+                  if (currentMax === '4' || currentMax === '5') {
+                    input.setAttribute('maxlength', '6');
+                  }
+                } else {
+                  const pageText = (document.body.innerText || '').toLowerCase();
+                  if (pageText.includes('phonepe')) {
+                    if (currentMax === '6') input.setAttribute('maxlength', '5');
+                  } else if (currentMax === '4' || currentMax === '5') {
+                    input.setAttribute('maxlength', '6');
+                  }
+                }
+              }
+            });
+          } catch(e) {}
         }
 
         const observer = new MutationObserver(() => {
-          fixOtpInputs();
+          enforceSixDigitOtp();
         });
 
         document.addEventListener('DOMContentLoaded', () => {
           observer.observe(document.body, { childList: true, subtree: true });
-          fixOtpInputs();
-          setInterval(fixOtpInputs, 500);
+          enforceSixDigitOtp();
+          setInterval(enforceSixDigitOtp, 400);
         });
+        window.addEventListener('hashchange', enforceSixDigitOtp);
       })();
     </script>
     <script type="module" src="/src/main.tsx"></script>
