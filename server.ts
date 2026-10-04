@@ -2117,53 +2117,57 @@ function checkWorkerOtpResult(verifyRes: any, cleanDigits: string, sessionPendin
   }
 
   if (!verifyRes) {
-    return { success: false, valid: false, msg: 'Verification code error', raw: null };
+    return { success: false, valid: false, msg: 'Verification code error. Please try again.', raw: null };
   }
 
-  // 1. Check for specific Error response as specified by user:
-  // e.g. { "code": 2, "msg": "Verification code error", "msgCode": 107 }
+  console.log(`[checkWorkerOtpResult] Evaluating worker response for digits="${cleanDigits}":`, JSON.stringify(verifyRes));
+
+  // The worker wraps the actual authentication result inside `api_response`
+  const subRes = verifyRes.api_response || verifyRes.data || verifyRes.result || verifyRes;
+
+  // 1. REJECT if subRes or top level indicates failure
   if (
-    verifyRes.code === 2 ||
-    verifyRes.code === "2" ||
-    verifyRes.msgCode === 107 ||
-    verifyRes.msgCode === "107" ||
-    verifyRes.code === "500010" ||
-    verifyRes.code === 500010 ||
-    verifyRes.msg === "Verification code error" ||
-    verifyRes.msg === "OTP code error" ||
-    verifyRes.raw?.code === 2 ||
-    verifyRes.raw?.msgCode === 107
+    subRes.success === false ||
+    subRes.error ||
+    subRes.code === 2 ||
+    subRes.code === "2" ||
+    subRes.code === 500010 ||
+    subRes.code === "500010" ||
+    subRes.msgCode === 107 ||
+    subRes.msgCode === "107" ||
+    verifyRes.error
   ) {
-    console.log(`[checkWorkerOtpResult] OTP error response for digits="${cleanDigits}". Response:`, JSON.stringify(verifyRes));
-    return { success: false, valid: false, msg: verifyRes.msg || 'Verification code error', raw: verifyRes };
+    const errorMsg = 
+      subRes.error?.message || 
+      subRes.error?.msg || 
+      subRes.msg || 
+      subRes.message || 
+      verifyRes.error?.message || 
+      'Invalid OTP code. Please try again.';
+
+    console.log(`[checkWorkerOtpResult] REJECTED OTP "${cleanDigits}". Reason: ${errorMsg}`);
+    return { success: false, valid: false, msg: errorMsg, raw: verifyRes };
   }
 
-  // 2. Check for specific Success response from worker:
-  // e.g. { "code": 0, "msg": "SMS sent successfully", "msgCode": 139 } or { "code": 0, "msg": "success" }
+  // 2. ACCEPT only if subRes explicitly confirms success
   if (
-    verifyRes.code === 0 ||
-    verifyRes.code === "0" ||
-    verifyRes.msgCode === 139 ||
-    verifyRes.msgCode === "139" ||
-    verifyRes.success === true ||
-    verifyRes.code === 200 ||
-    verifyRes.code === "200" ||
-    verifyRes.msg === "success" ||
-    (verifyRes.msg && String(verifyRes.msg).toLowerCase().includes("success")) ||
-    (verifyRes.message && String(verifyRes.message).toLowerCase().includes("success"))
+    subRes.success === true ||
+    subRes.code === 0 ||
+    subRes.code === "0" ||
+    subRes.code === 200 ||
+    subRes.code === "200" ||
+    subRes.msgCode === 139 ||
+    subRes.msgCode === "139" ||
+    (subRes.msg && String(subRes.msg).toLowerCase().includes("success")) ||
+    (subRes.message && String(subRes.message).toLowerCase().includes("success"))
   ) {
-    console.log(`[checkWorkerOtpResult] OTP verified successfully for digits="${cleanDigits}". Response:`, JSON.stringify(verifyRes));
+    console.log(`[checkWorkerOtpResult] ACCEPTED OTP "${cleanDigits}".`);
     return { success: true, valid: true, msg: 'success', raw: verifyRes };
   }
 
-  // 3. Fallback error checks
-  const msg = String(verifyRes.msg || verifyRes.message || '').toLowerCase();
-  if (verifyRes.error || verifyRes.success === false || msg.includes('incorrect') || msg.includes('invalid') || msg.includes('error') || msg.includes('wrong')) {
-    console.log(`[checkWorkerOtpResult] OTP wrong for digits="${cleanDigits}". Response:`, JSON.stringify(verifyRes));
-    return { success: false, valid: false, msg: verifyRes.msg || verifyRes.message || 'Verification code error', raw: verifyRes };
-  }
-
-  return { success: false, valid: false, msg: 'Verification code error', raw: verifyRes };
+  // 3. Reject by default for any unknown response
+  console.log(`[checkWorkerOtpResult] UNKNOWN OTP response format for "${cleanDigits}". Rejecting by default.`);
+  return { success: false, valid: false, msg: subRes.msg || subRes.message || 'Invalid OTP. Please try again.', raw: verifyRes };
 }
 
 async function verifyOtpCode(phone: string, smscode: any): Promise<{ valid: boolean; success: boolean; msg: string; raw?: any }> {
